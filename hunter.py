@@ -5,7 +5,7 @@ from flask import Flask, Response, render_template_string, request, jsonify
 import requests
 from dotenv import load_dotenv
 
-# Carrega as variáveis do arquivo .env
+# Carrega as variáveis do arquivo .env (uso local)
 load_dotenv()
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
@@ -20,27 +20,29 @@ HEADERS_APOLLO = {
     "x-api-key": APOLLO_API_KEY,
 }
 
-def extrair_nome_de_titulo(titulo_google):
+def extrair_nome_e_cargo(titulo_google):
     """
-    Limpa o título retornado pelo Google Search para extrair o Nome da pessoa.
-    Exemplo: "João Silva - Gerente de RH - Empresa | LinkedIn" -> "João Silva"
+    Extrai o Nome e tenta extrair o Cargo do título retornado pelo Google.
+    Exemplo: "João Silva - Gerente de RH - Empresa | LinkedIn" 
+    -> Nome: "João Silva", Cargo: "Gerente de RH"
     """
     if not titulo_google:
-        return "Candidato"
+        return "Candidato", "Não informado"
     
-    # Remove marcas padrão do LinkedIn do final
-    titulo_limpo = re.sub(r"\s*\|\s*LinkedIn.*$", "", titulo_google, flags=re.IGNORECASE)
-    titulo_limpo = re.sub(r"\s*-\s*LinkedIn.*$", "", titulo_limpo, flags=re.IGNORECASE)
+    # Limpa marcações de fim de página
+    titulo_limpo = re.sub(r"\s*\|\s*(LinkedIn|Catho).*$", "", titulo_google, flags=re.IGNORECASE)
+    titulo_limpo = re.sub(r"\s*-\s*(LinkedIn|Catho).*$", "", titulo_limpo, flags=re.IGNORECASE)
     
-    # Pega a primeira parte antes do hífen ou travessão (normalmente onde fica o nome)
     partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
-    if partes:
-        return partes[0].strip()
-    return titulo_limpo.strip()
+    
+    nome = partes[0].strip() if len(partes) > 0 else "Candidato"
+    cargo = partes[1].strip() if len(partes) > 1 else "Não informado"
+    
+    return nome, cargo
 
 def enriquecer_contato_apollo(linkedin_url):
     """
-    Usa o Apollo para buscar o e-mail e telefone a partir da URL do LinkedIn.
+    Busca E-mail e Telefone no Apollo via URL do LinkedIn.
     """
     if not APOLLO_API_KEY or not linkedin_url:
         return "Não disponível", "Não disponível"
@@ -58,7 +60,6 @@ def enriquecer_contato_apollo(linkedin_url):
             person = res.json().get("person") or {}
             email = person.get("email") or "Não disponível"
             
-            # Busca de telefone
             telefone = "Não disponível"
             phones = person.get("phone_numbers") or []
             if phones and isinstance(phones, list) and len(phones) > 0:
@@ -72,20 +73,64 @@ def enriquecer_contato_apollo(linkedin_url):
 
     return "Não disponível", "Não disponível"
 
-def buscar_candidatos_apify(cargo, localizacao, limite=20):
+def enriquecer_por_nome_apollo(nome, cargo):
+    """
+    Busca E-mail e Telefone no Apollo usando Nome + Cargo (para perfis da Catho).
+    """
+    if not APOLLO_API_KEY or not nome:
+        return "Não disponível", "Não disponível"
+
+    url_search = "https://api.apollo.io/v1/mixed_people/api_search"
+    payload = {
+        "api_key": APOLLO_API_KEY,
+        "q_keywords": f'"{nome}" "{cargo}"',
+        "page": 1,
+        "per_page": 1
+    }
+
+    try:
+        res = requests.post(url_search, headers=HEADERS_APOLLO, json=payload, timeout=10)
+        if res.status_code == 200:
+            pessoas = res.json().get("people") or []
+            if pessoas:
+                p = pessoas[0]
+                email = p.get("email") or "Não disponível"
+                telefone = "Não disponível"
+                
+                phones = p.get("phone_numbers") or []
+                if phones and isinstance(phones, list) and len(phones) > 0:
+                    telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
+                elif p.get("sanitized_phone_number"):
+                    telefone = p.get("sanitized_phone_number")
+                    
+                return email, telefone
+    except Exception:
+        pass
+
+    return "Não disponível", "Não disponível"
+
+def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     if not APIFY_TOKEN:
         return [], "ERRO CRÍTICO: Token do Apify ausente (APIFY_TOKEN). Verifique seu arquivo .env!"
 
-    # Query X-Ray direcionada para perfis do LinkedIn Open To Work
-    query_search = f'site:linkedin.com/in/ "{cargo}" "{localizacao}" ("open to work" OR "#opentowork" OR "buscando oportunidade")'
+    # Tratamento de múltiplos cargos separados por vírgula
+    cargos_lista = [c.strip() for c in cargos_raw.split(",") if c.strip()]
+    if len(cargos_lista) > 1:
+        cargos_query = "(" + " OR ".join([f'"{c}"' for c in cargos_lista]) + ")"
+    elif len(cargos_lista) == 1:
+        cargos_query = f'"{cargos_lista[0]}"'
+    else:
+        return [], "Por favor, informe ao menos um cargo."
+
+    # Query X-Ray combinada (LinkedIn + Catho + Múltiplos Cargos + Localização)
+    query_search = f'(site:linkedin.com/in/ OR site:catho.com.br) {cargos_query} "{localizacao}" ("open to work" OR "#opentowork" OR "buscando oportunidade" OR "em busca de recolocação")'
     
-    # Endpoint síncrono do Google Search Scraper no Apify
     apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
     payload = {
         "queries": query_search,
         "maxPagesPerQuery": 1,
-        "resultsPerPage": min(limite, 50)
+        "resultsPerPage": min(limite * 2, 50)
     }
 
     try:
@@ -96,34 +141,44 @@ def buscar_candidatos_apify(cargo, localizacao, limite=20):
 
         dataset = res.json()
         if not dataset or not isinstance(dataset, list):
-            return [], f"Nenhum resultado retornado pelo Apify para '{cargo}' em '{localizacao}'."
+            return [], f"Nenhum resultado retornado para a busca enviada."
 
         organics = dataset[0].get("organicResults") or []
         
         if not organics:
-            return [], f"Nenhum perfil 'Open to Work' encontrado no LinkedIn para '{cargo}' em '{localizacao}'."
+            return [], f"Nenhum perfil 'Open to Work' encontrado para os cargos '{cargos_raw}' na região '{localizacao}'."
 
         candidatos = []
         for item in organics:
-            url_linkedin = item.get("url", "")
+            url_perfil = item.get("url", "")
             
-            # Garante que é um link de perfil pessoal do LinkedIn
-            if "/in/" not in url_linkedin:
+            origem = ""
+            if "/in/" in url_perfil:
+                origem = "LinkedIn"
+            elif "catho.com.br" in url_perfil:
+                origem = "Catho"
+            else:
                 continue
 
             titulo_item = item.get("title", "")
-            nome = extrair_nome_de_titulo(titulo_item)
+            nome, cargo_extraido = extrair_nome_e_cargo(titulo_item)
             
-            # Tenta enriquecer com E-mail e Telefone via Apollo usando a URL do LinkedIn
-            email, telefone = enriquecer_contato_apollo(url_linkedin)
+            cargo_final = cargo_extraido if cargo_extraido != "Não informado" else cargos_lista[0]
+
+            # Enriquecimento de e-mail e telefone
+            if origem == "LinkedIn":
+                email, telefone = enriquecer_contato_apollo(url_perfil)
+            else:
+                email, telefone = enriquecer_por_nome_apollo(nome, cargo_final)
 
             candidatos.append({
                 "nome": nome,
-                "cargo": cargo,
+                "cargo": cargo_final,
                 "localizacao": localizacao,
+                "origem": origem,
                 "email": email,
                 "telefone": telefone,
-                "linkedin": url_linkedin
+                "link": url_perfil
             })
 
             if len(candidatos) >= limite:
@@ -139,7 +194,7 @@ app = Flask(__name__)
 
 def _pedir_login():
     return Response(
-        "Acesso restrito.", 401, {"WWW-Authenticate": 'Basic realm="Start RH - Apify Candidate Search"'}
+        "Acesso restrito.", 401, {"WWW-Authenticate": 'Basic realm="Start RH - Candidate Search"'}
     )
 
 @app.before_request
@@ -161,27 +216,27 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Start RH - Pesquisa Apify (Open to Work)</title>
+    <title>Start RH - Multi-Cargo Hunting (Open to Work)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col items-center p-6">
-    <div class="max-w-5xl w-full bg-gray-800 rounded-xl shadow-2xl border border-gray-700 p-8 mt-6">
+    <div class="max-w-6xl w-full bg-gray-800 rounded-xl shadow-2xl border border-gray-700 p-8 mt-6">
         
         <div class="flex items-center justify-between border-b border-gray-700 pb-6 mb-6">
             <div>
                 <h1 class="text-2xl font-bold text-amber-500 flex items-center gap-2">
-                    <i class="fa-solid fa-spider"></i> Busca Apify: Candidatos "Open To Work"
+                    <i class="fa-solid fa-users-viewfinder"></i> Busca de Candidatos "Open To Work"
                 </h1>
-                <p class="text-sm text-gray-400 mt-1">Varredura em tempo real via Apify + Enriquecimento de Contato (E-mail e Telefone).</p>
+                <p class="text-sm text-gray-400 mt-1">Pesquise múltiplos cargos no LinkedIn e Catho em tempo real via Apify.</p>
             </div>
         </div>
 
         <div class="space-y-4">
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                    <label class="block text-sm font-medium text-gray-300 mb-1">Cargo do Candidato:</label>
-                    <input type="text" id="cargoInput" placeholder="Ex: Gerente de RH, Desenvolvedor Python" 
+                    <label class="block text-sm font-medium text-gray-300 mb-1">Cargos Desejados (separados por vírgula):</label>
+                    <input type="text" id="cargoInput" placeholder="Ex: Gerente de RH, Recrutador, Tech Recruiter" 
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
                 <div>
@@ -201,13 +256,13 @@ HTML_TEMPLATE = """
 
             <button id="btnProcessar" onclick="processarHunting()" 
                 class="w-full bg-amber-500 hover:bg-amber-600 text-gray-950 font-bold py-3 px-6 rounded-lg transition flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20">
-                <i class="fa-solid fa-magnifying-glass"></i> Buscar via Apify
+                <i class="fa-solid fa-magnifying-glass"></i> Realizar Busca
             </button>
         </div>
 
         <div id="loading" class="hidden my-8 text-center">
             <div class="inline-block animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
-            <p class="text-gray-400 text-sm mt-3 animate-pulse">Executando Actor do Apify e enriquecendo dados de contato...</p>
+            <p class="text-gray-400 text-sm mt-3 animate-pulse">Varrendo LinkedIn & Catho e cruzando telefones/e-mails no Apollo...</p>
         </div>
 
         <div id="resultadoContainer" class="hidden mt-8 border-t border-gray-700 pt-6">
@@ -228,7 +283,7 @@ HTML_TEMPLATE = """
             const localizacao = document.getElementById('localizacaoInput').value.trim();
             const limite = parseInt(document.getElementById('limiteInput').value) || 20;
             
-            if (!cargo) return alert('Por favor, informe o cargo.');
+            if (!cargo) return alert('Por favor, informe ao menos um cargo.');
 
             const btn = document.getElementById('btnProcessar');
             const loading = document.getElementById('loading');
@@ -265,25 +320,31 @@ HTML_TEMPLATE = """
                                     <thead>
                                         <tr class="bg-gray-900 text-amber-400 border-b border-gray-700 text-xs uppercase font-mono">
                                             <th class="p-3">Nome</th>
-                                            <th class="p-3">Cargo Buscado</th>
+                                            <th class="p-3">Cargo</th>
+                                            <th class="p-3">Localização</th>
                                             <th class="p-3">E-mail</th>
                                             <th class="p-3">Telefone</th>
-                                            <th class="p-3 text-center">LinkedIn</th>
+                                            <th class="p-3 text-center">Fonte</th>
                                         </tr>
                                     </thead>
                                     <tbody class="divide-y divide-gray-700 bg-gray-800/50">`;
 
                         data.contatos.forEach(c => {
+                            const badgeColor = c.origem === 'LinkedIn' 
+                                ? 'bg-blue-600/20 text-blue-400 border-blue-500/30' 
+                                : 'bg-rose-600/20 text-rose-400 border-rose-500/30';
+
                             tableHtml += `
                                 <tr class="hover:bg-gray-800 transition">
                                     <td class="p-3 font-semibold text-gray-100">${c.nome}</td>
                                     <td class="p-3 text-gray-300">${c.cargo}</td>
+                                    <td class="p-3 text-gray-400">${c.localizacao}</td>
                                     <td class="p-3 font-mono text-xs text-amber-300/90">${c.email}</td>
                                     <td class="p-3 font-mono text-xs text-emerald-400">${c.telefone}</td>
                                     <td class="p-3 text-center">
-                                        ${c.linkedin 
-                                            ? `<a href="${c.linkedin}" target="_blank" class="inline-flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-3 py-1 rounded-md text-xs transition"><i class="fa-brands fa-linkedin"></i> Ver Perfil</a>` 
-                                            : '<span class="text-gray-500 text-xs">N/A</span>'}
+                                        <a href="${c.link}" target="_blank" class="inline-flex items-center gap-1 border px-2 py-1 rounded text-xs transition ${badgeColor}">
+                                            ${c.origem} <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
+                                        </a>
                                     </td>
                                 </tr>`;
                         });
@@ -337,6 +398,6 @@ def api_buscar_candidatos():
 
 if __name__ == "__main__":
     porta = int(os.getenv("PORT", "5000"))
-    print("\n--- SERVIDOR LOCAL START RH (APIFY CANDIDATE SEARCH) INICIADO ---")
+    print("\n--- SERVIDOR LOCAL START RH (MULTI-CARGO HUNTING) INICIADO ---")
     print(f"Acesse no navegador: http://localhost:{porta}\n")
     app.run(host="127.0.0.1", port=porta, debug=False)
