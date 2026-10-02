@@ -1,4 +1,5 @@
 import hmac
+import math
 import os
 import re
 from flask import Flask, Response, render_template_string, request, jsonify
@@ -20,26 +21,44 @@ HEADERS_APOLLO = {
     "x-api-key": APOLLO_API_KEY,
 }
 
-# Mapeamento simples de estados para melhorar a precisão da query
-ESTADOS_SIGLAS = {
-    "são paulo": '("são paulo" OR "sp")',
-    "rio de janeiro": '("rio de janeiro" OR "rj")',
-    "minas gerais": '("minas gerais" OR "mg")',
-    "paraná": '("paraná" OR "pr")',
-    "rio grande do sul": '("rio grande do sul" OR "rs")',
-    "santa catarina": '("santa catarina" OR "sc")',
-    "bahia": '("bahia" OR "ba")',
-    "distrito federal": '("distrito federal" OR "df" OR "brasília")',
-    "ceará": '("ceará" OR "ce")',
-    "pernambuco": '("pernambuco" OR "pe")',
+# Mapeamento completo dos 26 Estados + DF (Nomes e Siglas)
+MAPEAMENTO_ESTADOS = {
+    "são paulo": '("são paulo" OR "sp")', "sao paulo": '("são paulo" OR "sp")', "sp": '("são paulo" OR "sp")',
+    "rio de janeiro": '("rio de janeiro" OR "rj")', "rj": '("rio de janeiro" OR "rj")',
+    "minas gerais": '("minas gerais" OR "mg")', "mg": '("minas gerais" OR "mg")',
+    "espírito santo": '("espírito santo" OR "es")', "espirito santo": '("espírito santo" OR "es")', "es": '("espírito santo" OR "es")',
+    "paraná": '("paraná" OR "pr")', "parana": '("paraná" OR "pr")', "pr": '("paraná" OR "pr")',
+    "rio grande do sul": '("rio grande do sul" OR "rs")', "rs": '("rio grande do sul" OR "rs")',
+    "santa catarina": '("santa catarina" OR "sc")', "sc": '("santa catarina" OR "sc")',
+    "bahia": '("bahia" OR "ba")', "ba": '("bahia" OR "ba")',
+    "distrito federal": '("distrito federal" OR "df" OR "brasília")', "df": '("distrito federal" OR "df" OR "brasília")', "brasília": '("distrito federal" OR "df" OR "brasília")', "brasilia": '("distrito federal" OR "df" OR "brasília")',
+    "goiás": '("goiás" OR "go")', "goias": '("goiás" OR "go")', "go": '("goiás" OR "go")',
+    "mato grosso": '("mato grosso" OR "mt")', "mt": '("mato grosso" OR "mt")',
+    "mato grosso do sul": '("mato grosso do sul" OR "ms")', "ms": '("mato grosso do sul" OR "ms")',
+    "ceará": '("ceará" OR "ce")', "ceara": '("ceará" OR "ce")', "ce": '("ceará" OR "ce")',
+    "pernambuco": '("pernambuco" OR "pe")', "pe": '("pernambuco" OR "pe")',
+    "amazonas": '("amazonas" OR "am")', "am": '("amazonas" OR "am")',
+    "pará": '("pará" OR "pa")', "para": '("pará" OR "pa")', "pa": '("pará" OR "pa")',
+    "maranhão": '("maranhão" OR "ma")', "maranhao": '("maranhão" OR "ma")', "ma": '("maranhão" OR "ma")',
+    "paraíba": '("paraíba" OR "pb")', "paraiba": '("paraíba" OR "pb")', "pb": '("paraíba" OR "pb")',
+    "rio grande do norte": '("rio grande do norte" OR "rn")', "rn": '("rio grande do norte" OR "rn")',
+    "alagoas": '("alagoas" OR "al")', "al": '("alagoas" OR "al")',
+    "sergipe": '("sergipe" OR "se")', "se": '("sergipe" OR "se")',
+    "piauí": '("piauí" OR "pi")', "piaui": '("piauí" OR "pi")', "pi": '("piauí" OR "pi")',
+    "rondônia": '("rondônia" OR "ro")', "rondonia": '("rondônia" OR "ro")', "ro": '("rondônia" OR "ro")',
+    "tocantins": '("tocantins" OR "to")', "to": '("tocantins" OR "to")',
+    "acre": '("acre" OR "ac")', "ac": '("acre" OR "ac")',
+    "amapá": '("amapá" OR "ap")', "amapa": '("amapá" OR "ap")', "ap": '("amapá" OR "ap")',
+    "roraima": '("roraima" OR "rr")', "rr": '("roraima" OR "rr")'
 }
 
-def formatar_termo_localizacao(localizacao_raw):
-    loc_lower = localizacao_raw.strip().lower()
-    for estado, query_formatada in ESTADOS_SIGLAS.items():
-        if estado in loc_lower:
-            return query_formatada
-    return f'"{localizacao_raw.strip()}"'
+def formatar_query_localizacao(localizacao_raw):
+    loc_clean = localizacao_raw.strip().lower()
+    if loc_clean in MAPEAMENTO_ESTADOS:
+        return MAPEAMENTO_ESTADOS[loc_clean]
+    
+    cidade = localizacao_raw.strip()
+    return f'("{cidade}" OR "Região de {cidade}")'
 
 def extrair_nome_e_cargo(titulo_google):
     if not titulo_google:
@@ -57,7 +76,7 @@ def extrair_nome_e_cargo(titulo_google):
 
 def enriquecer_contato_apollo(linkedin_url):
     if not APOLLO_API_KEY or not linkedin_url:
-        return "Não disponível", "Não disponível", ""
+        return "Não disponível", "Não disponível"
 
     url_match = "https://api.apollo.io/v1/people/match"
     payload = {
@@ -78,17 +97,12 @@ def enriquecer_contato_apollo(linkedin_url):
                 telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
             elif person.get("sanitized_phone_number"):
                 telefone = person.get("sanitized_phone_number")
-                
-            city = person.get("city") or ""
-            state = person.get("state") or ""
-            country = person.get("country") or ""
-            loc_apollo = f"{city} {state} {country}".strip()
 
-            return email, telefone, loc_apollo
+            return email, telefone
     except Exception:
         pass
 
-    return "Não disponível", "Não disponível", ""
+    return "Não disponível", "Não disponível"
 
 def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     if not APIFY_TOKEN:
@@ -98,7 +112,7 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     if not cargos_lista:
         return [], "Por favor, informe ao menos um cargo."
 
-    loc_query = formatar_termo_localizacao(localizacao)
+    loc_query = formatar_query_localizacao(localizacao)
 
     queries_lista = []
     for cargo in cargos_lista:
@@ -108,16 +122,19 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
 
     query_final_str = "\n".join(queries_lista)
     
+    # Calcula dinamicamente quantas páginas do Google precisam ser raspadas (cada página tem ~10 resultados)
+    max_paginas = max(2, math.ceil(limite / 10) + 1)
+
     apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
     payload = {
         "queries": query_final_str,
-        "maxPagesPerQuery": 1,
-        "resultsPerPage": max(15, min(limite * 2, 50))
+        "maxPagesPerQuery": max_paginas,
+        "resultsPerPage": 20
     }
 
     try:
-        res = requests.post(apify_url, json=payload, timeout=90)
+        res = requests.post(apify_url, json=payload, timeout=120)
         
         if res.status_code not in (200, 201):
             return [], f"Apify retornou erro ({res.status_code}): {res.text}"
@@ -128,36 +145,24 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
 
         candidatos = []
         urls_vistas = set()
-        loc_termo_limpo = localizacao.strip().lower()
 
         for pagina_busca in dataset:
             organics = pagina_busca.get("organicResults") or []
             
             for item in organics:
                 url_perfil = item.get("url", "")
-                snippet = item.get("description", "") or item.get("snippet", "") or ""
                 titulo_item = item.get("title", "")
                 
                 if "/in/" not in url_perfil or url_perfil in urls_vistas:
                     continue
-
-                # Validação de localização no texto do snippet/título do Google
-                texto_completo_item = f"{titulo_item} {snippet}".lower()
-                
-                # Se o usuário digitou uma cidade/estado específica e ela não aparece no snippet nem no título, pula
-                if loc_termo_limpo not in texto_completo_item:
-                    # Verifica se ao menos a sigla do estado aparece no texto
-                    sigla = ESTADOS_SIGLAS.get(loc_termo_limpo)
-                    if not sigla or not any(s in texto_completo_item for s in [loc_termo_limpo, "sp", "rj", "mg", "pr", "rs", "sc", "ba", "df"]):
-                        continue
 
                 urls_vistas.add(url_perfil)
 
                 nome, cargo_extraido = extrair_nome_e_cargo(titulo_item)
                 cargo_final = cargo_extraido if cargo_extraido != "Não informado" else cargos_lista[0]
 
-                # Enriquecimento via Apollo
-                email, telefone, loc_apollo = enriquecer_contato_apollo(url_perfil)
+                # Enriquecimento de contato via Apollo
+                email, telefone = enriquecer_contato_apollo(url_perfil)
 
                 candidatos.append({
                     "nome": nome,
@@ -175,7 +180,7 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
                 break
 
         if not candidatos:
-            return [], f"Nenhum perfil encontrado para os cargos informados especificamente em '{localizacao}'."
+            return [], f"Nenhum perfil encontrado para os cargos informados em '{localizacao}'."
 
         return candidatos, None
 
@@ -221,7 +226,7 @@ HTML_TEMPLATE = """
                 <h1 class="text-2xl font-bold text-amber-500">
                     Busca: Perfis Dentro do Esperado
                 </h1>
-                <p class="text-sm text-gray-400 mt-1">Pesquise perfis no LinkedIn em tempo real via Apify.</p>
+                <p class="text-sm text-gray-400 mt-1">Pesquise perfis no LinkedIn por Cidade ou Estado em tempo real via Apify.</p>
             </div>
         </div>
 
@@ -233,8 +238,8 @@ HTML_TEMPLATE = """
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
                 <div>
-                    <label class="block text-sm font-medium text-gray-300 mb-1">Localização do Candidato:</label>
-                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: São Paulo, Rio de Janeiro, Curitiba" 
+                    <label class="block text-sm font-medium text-gray-300 mb-1">Localização (Cidade ou Estado):</label>
+                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: Campinas, SP, Rio de Janeiro, Curitiba" 
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
             </div>
