@@ -5,7 +5,7 @@ from flask import Flask, Response, render_template_string, request, jsonify
 import requests
 from dotenv import load_dotenv
 
-# Carrega as variáveis do arquivo .env
+# Carrega as variáveis do arquivo .env (uso local)
 load_dotenv()
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
@@ -127,14 +127,12 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     if not cargos_lista:
         return [], "Por favor, informe ao menos um cargo."
 
-    # Gera uma lista de buscas limpas e individuais para o Apify executar em paralelo
+    # Gera buscas individuais para LinkedIn e Catho para cada cargo
     queries_lista = []
     for cargo in cargos_lista:
-        # Busca no LinkedIn (com trava Open to Work)
         queries_lista.append(
-            f'site:linkedin.com/in/ "{cargo}" "{localizacao}" ("open to work" OR "#opentowork" OR "buscando oportunidade" OR "em busca de recolocação")'
+            f'site:linkedin.com/in/ "{cargo}" "{localizacao}"'
         )
-        # Busca na Catho (sem trava Open to Work, pois todo perfil na Catho já é candidato)
         queries_lista.append(
             f'site:catho.com.br "{cargo}" "{localizacao}"'
         )
@@ -162,7 +160,6 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
         candidatos = []
         urls_vistas = set()
 
-        # Itera por cada grupo de resultados das consultas enviadas
         for pagina_busca in dataset:
             organics = pagina_busca.get("organicResults") or []
             
@@ -244,7 +241,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Start RH - Busca de Candidatos</title>
+    <title>Start RH - Busca</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 </head>
@@ -253,10 +250,10 @@ HTML_TEMPLATE = """
         
         <div class="flex items-center justify-between border-b border-gray-700 pb-6 mb-6">
             <div>
-                <h1 class="text-2xl font-bold text-amber-500 flex items-center gap-2">
-                    <i class="fa-solid fa-users-viewfinder"></i> Busca de Candidatos "Open To Work"
+                <h1 class="text-2xl font-bold text-amber-500">
+                    Busca
                 </h1>
-                <p class="text-sm text-gray-400 mt-1">Pesquise múltiplos cargos no LinkedIn e Catho em tempo real via Apify.</p>
+                <p class="text-sm text-gray-400 mt-1">Pesquise múltiplos cargos no LinkedIn e na Catho em tempo real via Apify.</p>
             </div>
         </div>
 
@@ -284,7 +281,7 @@ HTML_TEMPLATE = """
 
             <button id="btnProcessar" onclick="processarHunting()" 
                 class="w-full bg-amber-500 hover:bg-amber-600 text-gray-950 font-bold py-3 px-6 rounded-lg transition flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20">
-                <i class="fa-solid fa-magnifying-glass"></i> Realizar Busca
+                <i class="fa-solid fa-magnifying-glass"></i> Buscar
             </button>
         </div>
 
@@ -426,6 +423,6 @@ def api_buscar_candidatos():
 
 if __name__ == "__main__":
     porta = int(os.getenv("PORT", "5000"))
-    print("\n--- SERVIDOR LOCAL START RH (HUNTING MULTI-FONTE) INICIADO ---")
+    print("\n--- SERVIDOR LOCAL START RH INICIADO ---")
     print(f"Acesse no navegador: http://localhost:{porta}\n")
     app.run(host="127.0.0.1", port=porta, debug=False)
