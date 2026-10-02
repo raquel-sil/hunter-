@@ -20,19 +20,13 @@ HEADERS_APOLLO = {
 }
 
 def formatar_localizacao_query(loc_raw):
-    """
-    Formata cidades ou estados para consulta X-Ray.
-    Exemplo: 'Campinas, SP' -> '("Campinas" OR "Campinas, SP")'
-    """
     loc_limpa = loc_raw.strip()
     if "," in loc_limpa:
         partes = [p.strip() for p in loc_limpa.split(",") if p.strip()]
-        cidade = partes[0]
-        return f'("{cidade}" OR "{loc_limpa}")'
+        return f'("{partes[0]}" OR "{loc_limpa}")'
     elif "-" in loc_limpa:
         partes = [p.strip() for p in loc_limpa.split("-") if p.strip()]
-        cidade = partes[0]
-        return f'("{cidade}" OR "{loc_limpa}")'
+        return f'("{partes[0]}" OR "{loc_limpa}")'
     
     return f'"{loc_limpa}"'
 
@@ -62,19 +56,22 @@ def enriquecer_contato_apollo(linkedin_url):
     }
 
     try:
-        res = requests.post(url_match, headers=HEADERS_APOLLO, json=payload, timeout=5)
+        # Timeout curto de 2s por perfil para não travar a requisição principal
+        res = requests.post(url_match, headers=HEADERS_APOLLO, json=payload, timeout=2)
         if res.status_code == 200:
-            person = res.json().get("person") or {}
-            email = person.get("email") or "Não disponível"
-            
-            telefone = "Não disponível"
-            phones = person.get("phone_numbers") or []
-            if phones and isinstance(phones, list) and len(phones) > 0:
-                telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
-            elif person.get("sanitized_phone_number"):
-                telefone = person.get("sanitized_phone_number")
+            data = res.json()
+            if isinstance(data, dict):
+                person = data.get("person") or {}
+                email = person.get("email") or "Não disponível"
                 
-            return email, telefone
+                telefone = "Não disponível"
+                phones = person.get("phone_numbers") or []
+                if isinstance(phones, list) and len(phones) > 0 and isinstance(phones[0], dict):
+                    telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
+                elif person.get("sanitized_phone_number"):
+                    telefone = person.get("sanitized_phone_number")
+                    
+                return email, telefone
     except Exception:
         pass
 
@@ -89,7 +86,6 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
         return [], "Por favor, informe ao menos um cargo."
 
     loc_query = formatar_localizacao_query(localizacao)
-
     queries_lista = [f'site:linkedin.com/in/ "{cargo}" {loc_query}' for cargo in cargos_lista]
     query_final_str = "\n".join(queries_lista)
     
@@ -98,16 +94,21 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     payload = {
         "queries": query_final_str,
         "maxPagesPerQuery": 1,
-        "resultsPerPage": max(10, min(limite, 30))
+        "resultsPerPage": min(limite, 25)
     }
 
     try:
-        res = requests.post(apify_url, json=payload, timeout=35)
+        # Timeout máximo de 20s para o Apify responder bem dentro do limite do Gunicorn
+        res = requests.post(apify_url, json=payload, timeout=20)
         
         if res.status_code not in (200, 201):
             return [], f"Apify retornou erro HTTP {res.status_code}: {res.text[:150]}"
 
-        dataset = res.json()
+        try:
+            dataset = res.json()
+        except Exception:
+            return [], "Apify retornou uma resposta em formato inválido."
+
         if not dataset or not isinstance(dataset, list):
             return [], "Nenhum resultado retornado do Apify."
 
@@ -156,18 +157,17 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
         return candidatos, None
 
     except requests.exceptions.Timeout:
-        return [], "Tempo limite esgotado ao consultar Apify/Google. Tente uma busca com menor limite."
+        return [], "O tempo limite de busca esgotou. Tente pesquisar um número menor de candidatos ou apenas um cargo por vez."
     except Exception as e:
         return [], f"Erro ao processar busca: {str(e)}"
 
 
 app = Flask(__name__)
 
-# Garante resposta JSON mesmo em falhas do servidor
 @app.errorhandler(Exception)
 def tratar_erro_generico(e):
     code = getattr(e, "code", 500)
-    return jsonify({"status": "error", "message": f"Erro no servidor ({code}): {str(e)}"}), code
+    return jsonify({"status": "error", "message": f"Erro interno ({code}): {str(e)}"}), code
 
 def _pedir_login():
     return Response(
@@ -178,7 +178,7 @@ def _pedir_login():
 def exigir_login():
     if not APP_USER or not APP_PASSWORD:
         if request.path.startswith("/api/"):
-            return jsonify({"status": "error", "message": "APP_USER/APP_PASSWORD não configurados nas variáveis de ambiente."}), 503
+            return jsonify({"status": "error", "message": "APP_USER/APP_PASSWORD não configurados no painel."}), 503
         return Response("APP_USER/APP_PASSWORD não configurados.", 503)
 
     auth = request.authorization
@@ -230,7 +230,7 @@ HTML_TEMPLATE = """
                 <label class="block text-sm font-medium text-gray-300 mb-1">
                     Quantidade máxima de candidatos:
                 </label>
-                <input type="number" id="limiteInput" value="20" min="1" max="50"
+                <input type="number" id="limiteInput" value="15" min="1" max="30"
                     class="w-32 bg-gray-900 border border-gray-700 rounded-lg p-2 text-gray-100 focus:outline-none focus:border-amber-500 transition font-mono text-sm">
             </div>
 
@@ -261,7 +261,7 @@ HTML_TEMPLATE = """
         async function processarHunting() {
             const cargo = document.getElementById('cargoInput').value.trim();
             const localizacao = document.getElementById('localizacaoInput').value.trim();
-            const limite = parseInt(document.getElementById('limiteInput').value) || 20;
+            const limite = parseInt(document.getElementById('limiteInput').value) || 15;
             
             if (!cargo) return alert('Por favor, informe ao menos um cargo.');
 
@@ -287,7 +287,7 @@ HTML_TEMPLATE = """
                 const contentType = response.headers.get("content-type") || "";
                 if (!contentType.includes("application/json")) {
                     const rawHtml = await response.text();
-                    throw new Error(`Servidor respondeu com formato inválido (Status ${response.status}). Conteúdo: ${rawHtml.substring(0, 120)}...`);
+                    throw new Error(`Servidor respondeu com erro (${response.status}). Verifique os logs no Render.`);
                 }
 
                 const data = await response.json();
@@ -361,9 +361,9 @@ def api_buscar_candidatos():
     cargo = data.get("cargo", "").strip()
     localizacao = data.get("localizacao", "").strip()
     try:
-        limite = max(1, min(int(data.get("limite", 20)), 50))
+        limite = max(1, min(int(data.get("limite", 15)), 30))
     except (TypeError, ValueError):
-        limite = 20
+        limite = 15
 
     if not cargo:
         return jsonify({"status": "error", "message": "O campo 'cargo' é obrigatório."}), 400
