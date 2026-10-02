@@ -5,7 +5,7 @@ from flask import Flask, Response, render_template_string, request, jsonify
 import requests
 from dotenv import load_dotenv
 
-# Carrega as variáveis do arquivo .env (uso local)
+# Carrega as variáveis do arquivo .env
 load_dotenv()
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
@@ -20,11 +20,10 @@ HEADERS_APOLLO = {
     "x-api-key": APOLLO_API_KEY,
 }
 
-def extrair_nome_e_cargo(titulo_google):
+def extrair_nome_e_cargo(titulo_google, origem="LinkedIn"):
     """
-    Extrai o Nome e tenta extrair o Cargo do título retornado pelo Google.
-    Exemplo: "João Silva - Gerente de RH - Empresa | LinkedIn" 
-    -> Nome: "João Silva", Cargo: "Gerente de RH"
+    Trata os títulos retornados pelo Google Search para extrair Nome e Cargo.
+    Ajustado para lidar com o formato específico do LinkedIn e da Catho.
     """
     if not titulo_google:
         return "Candidato", "Não informado"
@@ -33,8 +32,19 @@ def extrair_nome_e_cargo(titulo_google):
     titulo_limpo = re.sub(r"\s*\|\s*(LinkedIn|Catho).*$", "", titulo_google, flags=re.IGNORECASE)
     titulo_limpo = re.sub(r"\s*-\s*(LinkedIn|Catho).*$", "", titulo_limpo, flags=re.IGNORECASE)
     
+    if origem == "Catho":
+        # Formato comum Catho: "Currículo de Gerente de RH em São Paulo, SP"
+        titulo_limpo = re.sub(r"^(Currículo de|Perfil de|Candidato:?)\s*", "", titulo_limpo, flags=re.IGNORECASE)
+        partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
+        first_part = partes[0].strip()
+        
+        if " em " in first_part.lower():
+            cargo = re.split(r"\s+em\s+", first_part, flags=re.IGNORECASE)[0].strip()
+            return "Candidato (Catho)", cargo
+        return "Candidato (Catho)", first_part
+
+    # Formato LinkedIn: "João Silva - Gerente de RH - Empresa"
     partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
-    
     nome = partes[0].strip() if len(partes) > 0 else "Candidato"
     cargo = partes[1].strip() if len(partes) > 1 else "Não informado"
     
@@ -77,7 +87,7 @@ def enriquecer_por_nome_apollo(nome, cargo):
     """
     Busca E-mail e Telefone no Apollo usando Nome + Cargo (para perfis da Catho).
     """
-    if not APOLLO_API_KEY or not nome:
+    if not APOLLO_API_KEY or not nome or "Candidato" in nome:
         return "Não disponível", "Não disponível"
 
     url_search = "https://api.apollo.io/v1/mixed_people/api_search"
@@ -113,76 +123,94 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     if not APIFY_TOKEN:
         return [], "ERRO CRÍTICO: Token do Apify ausente (APIFY_TOKEN). Verifique seu arquivo .env!"
 
-    # Tratamento de múltiplos cargos separados por vírgula
     cargos_lista = [c.strip() for c in cargos_raw.split(",") if c.strip()]
-    if len(cargos_lista) > 1:
-        cargos_query = "(" + " OR ".join([f'"{c}"' for c in cargos_lista]) + ")"
-    elif len(cargos_lista) == 1:
-        cargos_query = f'"{cargos_lista[0]}"'
-    else:
+    if not cargos_lista:
         return [], "Por favor, informe ao menos um cargo."
 
-    # Query X-Ray combinada (LinkedIn + Catho + Múltiplos Cargos + Localização)
-    query_search = f'(site:linkedin.com/in/ OR site:catho.com.br) {cargos_query} "{localizacao}" ("open to work" OR "#opentowork" OR "buscando oportunidade" OR "em busca de recolocação")'
+    # Gera uma lista de buscas limpas e individuais para o Apify executar em paralelo
+    queries_lista = []
+    for cargo in cargos_lista:
+        # Busca no LinkedIn (com trava Open to Work)
+        queries_lista.append(
+            f'site:linkedin.com/in/ "{cargo}" "{localizacao}" ("open to work" OR "#opentowork" OR "buscando oportunidade" OR "em busca de recolocação")'
+        )
+        # Busca na Catho (sem trava Open to Work, pois todo perfil na Catho já é candidato)
+        queries_lista.append(
+            f'site:catho.com.br "{cargo}" "{localizacao}"'
+        )
+
+    query_final_str = "\n".join(queries_lista)
     
     apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
     payload = {
-        "queries": query_search,
+        "queries": query_final_str,
         "maxPagesPerQuery": 1,
-        "resultsPerPage": min(limite * 2, 50)
+        "resultsPerPage": max(10, min(limite, 50))
     }
 
     try:
-        res = requests.post(apify_url, json=payload, timeout=60)
+        res = requests.post(apify_url, json=payload, timeout=90)
         
         if res.status_code not in (200, 201):
             return [], f"Apify retornou erro ({res.status_code}): {res.text}"
 
         dataset = res.json()
         if not dataset or not isinstance(dataset, list):
-            return [], f"Nenhum resultado retornado para a busca enviada."
-
-        organics = dataset[0].get("organicResults") or []
-        
-        if not organics:
-            return [], f"Nenhum perfil 'Open to Work' encontrado para os cargos '{cargos_raw}' na região '{localizacao}'."
+            return [], "Nenhum resultado retornado para os cargos informados."
 
         candidatos = []
-        for item in organics:
-            url_perfil = item.get("url", "")
+        urls_vistas = set()
+
+        # Itera por cada grupo de resultados das consultas enviadas
+        for pagina_busca in dataset:
+            organics = pagina_busca.get("organicResults") or []
             
-            origem = ""
-            if "/in/" in url_perfil:
-                origem = "LinkedIn"
-            elif "catho.com.br" in url_perfil:
-                origem = "Catho"
-            else:
-                continue
+            for item in organics:
+                url_perfil = item.get("url", "")
+                
+                if url_perfil in urls_vistas:
+                    continue
 
-            titulo_item = item.get("title", "")
-            nome, cargo_extraido = extrair_nome_e_cargo(titulo_item)
-            
-            cargo_final = cargo_extraido if cargo_extraido != "Não informado" else cargos_lista[0]
+                origem = ""
+                if "/in/" in url_perfil:
+                    origem = "LinkedIn"
+                elif "catho.com.br" in url_perfil:
+                    origem = "Catho"
+                else:
+                    continue
 
-            # Enriquecimento de e-mail e telefone
-            if origem == "LinkedIn":
-                email, telefone = enriquecer_contato_apollo(url_perfil)
-            else:
-                email, telefone = enriquecer_por_nome_apollo(nome, cargo_final)
+                urls_vistas.add(url_perfil)
 
-            candidatos.append({
-                "nome": nome,
-                "cargo": cargo_final,
-                "localizacao": localizacao,
-                "origem": origem,
-                "email": email,
-                "telefone": telefone,
-                "link": url_perfil
-            })
+                titulo_item = item.get("title", "")
+                nome, cargo_extraido = extrair_nome_e_cargo(titulo_item, origem=origem)
+                
+                cargo_final = cargo_extraido if cargo_extraido != "Não informado" else cargos_lista[0]
+
+                # Enriquecimento de contato
+                if origem == "LinkedIn":
+                    email, telefone = enriquecer_contato_apollo(url_perfil)
+                else:
+                    email, telefone = enriquecer_por_nome_apollo(nome, cargo_final)
+
+                candidatos.append({
+                    "nome": nome,
+                    "cargo": cargo_final,
+                    "localizacao": localizacao,
+                    "origem": origem,
+                    "email": email,
+                    "telefone": telefone,
+                    "link": url_perfil
+                })
+
+                if len(candidatos) >= limite:
+                    break
 
             if len(candidatos) >= limite:
                 break
+
+        if not candidatos:
+            return [], f"Nenhum perfil encontrado para os cargos '{cargos_raw}' na região '{localizacao}'."
 
         return candidatos, None
 
@@ -216,7 +244,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Start RH - Multi-Cargo Hunting (Open to Work)</title>
+    <title>Start RH - Busca de Candidatos</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 </head>
@@ -398,6 +426,6 @@ def api_buscar_candidatos():
 
 if __name__ == "__main__":
     porta = int(os.getenv("PORT", "5000"))
-    print("\n--- SERVIDOR LOCAL START RH (MULTI-CARGO HUNTING) INICIADO ---")
+    print("\n--- SERVIDOR LOCAL START RH (HUNTING MULTI-FONTE) INICIADO ---")
     print(f"Acesse no navegador: http://localhost:{porta}\n")
     app.run(host="127.0.0.1", port=porta, debug=False)
