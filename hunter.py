@@ -5,7 +5,6 @@ from flask import Flask, Response, render_template_string, request, jsonify
 import requests
 from dotenv import load_dotenv
 
-# Carrega as variáveis do arquivo .env (uso local)
 load_dotenv()
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
@@ -22,9 +21,8 @@ HEADERS_APOLLO = {
 
 def formatar_localizacao_query(loc_raw):
     """
-    Trata o texto da localização (cidade ou estado) para a busca no Google não zerar.
+    Formata cidades ou estados para consulta X-Ray.
     Exemplo: 'Campinas, SP' -> '("Campinas" OR "Campinas, SP")'
-    Exemplo: 'Curitiba' -> '"Curitiba"'
     """
     loc_limpa = loc_raw.strip()
     if "," in loc_limpa:
@@ -84,7 +82,7 @@ def enriquecer_contato_apollo(linkedin_url):
 
 def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     if not APIFY_TOKEN:
-        return [], "ERRO CRÍTICO: Token do Apify ausente (APIFY_TOKEN). Verifique seu arquivo .env!"
+        return [], "Token do Apify ausente (APIFY_TOKEN). Verifique as variáveis de ambiente!"
 
     cargos_lista = [c.strip() for c in cargos_raw.split(",") if c.strip()]
     if not cargos_lista:
@@ -92,39 +90,38 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
 
     loc_query = formatar_localizacao_query(localizacao)
 
-    queries_lista = []
-    for cargo in cargos_lista:
-        queries_lista.append(
-            f'site:linkedin.com/in/ "{cargo}" {loc_query}'
-        )
-
+    queries_lista = [f'site:linkedin.com/in/ "{cargo}" {loc_query}' for cargo in cargos_lista]
     query_final_str = "\n".join(queries_lista)
     
     apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
     payload = {
         "queries": query_final_str,
-        "maxPagesPerQuery": 2,
-        "resultsPerPage": 20
+        "maxPagesPerQuery": 1,
+        "resultsPerPage": max(10, min(limite, 30))
     }
 
     try:
-        res = requests.post(apify_url, json=payload, timeout=45)
+        res = requests.post(apify_url, json=payload, timeout=35)
         
         if res.status_code not in (200, 201):
-            return [], f"Apify retornou erro ({res.status_code}): {res.text}"
+            return [], f"Apify retornou erro HTTP {res.status_code}: {res.text[:150]}"
 
         dataset = res.json()
         if not dataset or not isinstance(dataset, list):
-            return [], "Nenhum resultado retornado para os cargos informados."
+            return [], "Nenhum resultado retornado do Apify."
 
         candidatos = []
         urls_vistas = set()
 
         for pagina_busca in dataset:
+            if not isinstance(pagina_busca, dict):
+                continue
             organics = pagina_busca.get("organicResults") or []
             
             for item in organics:
+                if not isinstance(item, dict):
+                    continue
                 url_perfil = item.get("url", "")
                 
                 if "/in/" not in url_perfil or url_perfil in urls_vistas:
@@ -134,10 +131,8 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
 
                 titulo_item = item.get("title", "")
                 nome, cargo_extraido = extrair_nome_e_cargo(titulo_item)
-                
                 cargo_final = cargo_extraido if cargo_extraido != "Não informado" else cargos_lista[0]
 
-                # Enriquecimento de e-mail e telefone via Apollo
                 email, telefone = enriquecer_contato_apollo(url_perfil)
 
                 candidatos.append({
@@ -160,11 +155,19 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
 
         return candidatos, None
 
+    except requests.exceptions.Timeout:
+        return [], "Tempo limite esgotado ao consultar Apify/Google. Tente uma busca com menor limite."
     except Exception as e:
-        return [], f"Falha ao conectar com Apify: {str(e)}"
+        return [], f"Erro ao processar busca: {str(e)}"
 
 
 app = Flask(__name__)
+
+# Garante resposta JSON mesmo em falhas do servidor
+@app.errorhandler(Exception)
+def tratar_erro_generico(e):
+    code = getattr(e, "code", 500)
+    return jsonify({"status": "error", "message": f"Erro no servidor ({code}): {str(e)}"}), code
 
 def _pedir_login():
     return Response(
@@ -174,7 +177,10 @@ def _pedir_login():
 @app.before_request
 def exigir_login():
     if not APP_USER or not APP_PASSWORD:
-        return Response("Servidor sem APP_USER/APP_PASSWORD configurados.", 503)
+        if request.path.startswith("/api/"):
+            return jsonify({"status": "error", "message": "APP_USER/APP_PASSWORD não configurados nas variáveis de ambiente."}), 503
+        return Response("APP_USER/APP_PASSWORD não configurados.", 503)
+
     auth = request.authorization
     if not auth:
         return _pedir_login()
@@ -277,16 +283,22 @@ HTML_TEMPLATE = """
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ cargo: cargo, localizacao: localizacao, limite: limite })
                 });
+
+                const contentType = response.headers.get("content-type") || "";
+                if (!contentType.includes("application/json")) {
+                    const rawHtml = await response.text();
+                    throw new Error(`Servidor respondeu com formato inválido (Status ${response.status}). Conteúdo: ${rawHtml.substring(0, 120)}...`);
+                }
+
                 const data = await response.json();
-                
                 loading.classList.add('hidden');
                 resultadoContainer.classList.remove('hidden');
 
-                if (data.status === 'success') {
+                if (response.ok && data.status === 'success') {
                     totalBadge.innerText = `${data.contatos.length} Candidato(s)`;
 
                     if (data.contatos.length === 0) {
-                        logList.innerHTML = `<p class="text-rose-400 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-triangle-exclamation"></i> <b>Aviso:</b> ${data.erro}</p>`;
+                        logList.innerHTML = `<p class="text-rose-400 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-triangle-exclamation"></i> <b>Aviso:</b> ${data.erro || 'Nenhum perfil encontrado.'}</p>`;
                     } else {
                         let tableHtml = `
                             <div class="overflow-x-auto">
@@ -323,12 +335,12 @@ HTML_TEMPLATE = """
                         logList.innerHTML = tableHtml;
                     }
                 } else {
-                    logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-bomb"></i> Erro no servidor: ${data.message}</p>`;
+                    logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-bomb"></i> <b>Erro:</b> ${data.message || data.erro || 'Falha na requisição.'}</p>`;
                 }
             } catch (err) {
                 loading.classList.add('hidden');
                 resultadoContainer.classList.remove('hidden');
-                logList.innerHTML = `<p class="text-rose-500">Erro na requisição: ${err.message}</p>`;
+                logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-circle-exclamation"></i> ${err.message}</p>`;
             } finally {
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
