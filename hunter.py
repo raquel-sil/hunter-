@@ -122,7 +122,7 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
 
     query_final_str = "\n".join(queries_lista)
     
-    # Calcula dinamicamente quantas páginas do Google precisam ser raspadas (cada página tem ~10 resultados)
+    # Calcula dinamicamente quantas páginas do Google precisam ser raspadas
     max_paginas = max(2, math.ceil(limite / 10) + 1)
 
     apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
@@ -301,6 +301,13 @@ HTML_TEMPLATE = """
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ cargo: cargo, localizacao: localizacao, limite: limite })
                 });
+
+                // Captura se o servidor respondeu com erro HTML (ex: 500, 503, 504)
+                if (!response.ok) {
+                    const erroTexto = await response.text();
+                    throw new Error(`Erro ${response.status} no servidor: ${erroTexto.substring(0, 150)}`);
+                }
+
                 const data = await response.json();
                 
                 loading.classList.add('hidden');
@@ -352,7 +359,7 @@ HTML_TEMPLATE = """
             } catch (err) {
                 loading.classList.add('hidden');
                 resultadoContainer.classList.remove('hidden');
-                logList.innerHTML = `<p class="text-rose-500">Erro na requisição: ${err.message}</p>`;
+                logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-circle-exclamation"></i> ${err.message}</p>`;
             } finally {
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
