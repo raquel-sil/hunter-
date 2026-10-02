@@ -1,4 +1,5 @@
 import hmac
+import math
 import os
 import re
 from flask import Flask, Response, render_template_string, request, jsonify
@@ -56,7 +57,6 @@ def enriquecer_contato_apollo(linkedin_url):
     }
 
     try:
-        # Timeout curto de 2s por perfil para não travar a requisição principal
         res = requests.post(url_match, headers=HEADERS_APOLLO, json=payload, timeout=2)
         if res.status_code == 200:
             data = res.json()
@@ -77,7 +77,7 @@ def enriquecer_contato_apollo(linkedin_url):
 
     return "Não disponível", "Não disponível"
 
-def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
+def buscar_candidatos_apify(cargos_raw, localizacao, limite=100):
     if not APIFY_TOKEN:
         return [], "Token do Apify ausente (APIFY_TOKEN). Verifique as variáveis de ambiente!"
 
@@ -89,17 +89,19 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     queries_lista = [f'site:linkedin.com/in/ "{cargo}" {loc_query}' for cargo in cargos_lista]
     query_final_str = "\n".join(queries_lista)
     
+    # Calcula páginas dinamicamente (10 resultados por página do Google)
+    max_paginas = min(10, max(1, math.ceil(limite / 10)))
+
     apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
     payload = {
         "queries": query_final_str,
-        "maxPagesPerQuery": 1,
-        "resultsPerPage": min(limite, 25)
+        "maxPagesPerQuery": max_paginas,
+        "resultsPerPage": 10
     }
 
     try:
-        # Timeout máximo de 20s para o Apify responder bem dentro do limite do Gunicorn
-        res = requests.post(apify_url, json=payload, timeout=20)
+        res = requests.post(apify_url, json=payload, timeout=60)
         
         if res.status_code not in (200, 201):
             return [], f"Apify retornou erro HTTP {res.status_code}: {res.text[:150]}"
@@ -157,7 +159,7 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
         return candidatos, None
 
     except requests.exceptions.Timeout:
-        return [], "O tempo limite de busca esgotou. Tente pesquisar um número menor de candidatos ou apenas um cargo por vez."
+        return [], "O tempo limite de busca esgotou no servidor. Reduza o número de candidatos solicitados."
     except Exception as e:
         return [], f"Erro ao processar busca: {str(e)}"
 
@@ -228,9 +230,9 @@ HTML_TEMPLATE = """
 
             <div>
                 <label class="block text-sm font-medium text-gray-300 mb-1">
-                    Quantidade máxima de candidatos:
+                    Quantidade desejada de candidatos:
                 </label>
-                <input type="number" id="limiteInput" value="15" min="1" max="30"
+                <input type="number" id="limiteInput" value="20" min="1" placeholder="Ex: 50"
                     class="w-32 bg-gray-900 border border-gray-700 rounded-lg p-2 text-gray-100 focus:outline-none focus:border-amber-500 transition font-mono text-sm">
             </div>
 
@@ -261,7 +263,7 @@ HTML_TEMPLATE = """
         async function processarHunting() {
             const cargo = document.getElementById('cargoInput').value.trim();
             const localizacao = document.getElementById('localizacaoInput').value.trim();
-            const limite = parseInt(document.getElementById('limiteInput').value) || 15;
+            const limite = parseInt(document.getElementById('limiteInput').value) || 20;
             
             if (!cargo) return alert('Por favor, informe ao menos um cargo.');
 
@@ -361,9 +363,9 @@ def api_buscar_candidatos():
     cargo = data.get("cargo", "").strip()
     localizacao = data.get("localizacao", "").strip()
     try:
-        limite = max(1, min(int(data.get("limite", 15)), 30))
+        limite = max(1, min(int(data.get("limite", 20)), 100))
     except (TypeError, ValueError):
-        limite = 15
+        limite = 20
 
     if not cargo:
         return jsonify({"status": "error", "message": "O campo 'cargo' é obrigatório."}), 400
