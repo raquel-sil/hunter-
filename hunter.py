@@ -1,5 +1,4 @@
 import hmac
-import math
 import os
 import re
 from flask import Flask, Response, render_template_string, request, jsonify
@@ -21,50 +20,29 @@ HEADERS_APOLLO = {
     "x-api-key": APOLLO_API_KEY,
 }
 
-# Mapeamento completo dos 26 Estados + DF (Nomes e Siglas)
-MAPEAMENTO_ESTADOS = {
-    "são paulo": '("são paulo" OR "sp")', "sao paulo": '("são paulo" OR "sp")', "sp": '("são paulo" OR "sp")',
-    "rio de janeiro": '("rio de janeiro" OR "rj")', "rj": '("rio de janeiro" OR "rj")',
-    "minas gerais": '("minas gerais" OR "mg")', "mg": '("minas gerais" OR "mg")',
-    "espírito santo": '("espírito santo" OR "es")', "espirito santo": '("espírito santo" OR "es")', "es": '("espírito santo" OR "es")',
-    "paraná": '("paraná" OR "pr")', "parana": '("paraná" OR "pr")', "pr": '("paraná" OR "pr")',
-    "rio grande do sul": '("rio grande do sul" OR "rs")', "rs": '("rio grande do sul" OR "rs")',
-    "santa catarina": '("santa catarina" OR "sc")', "sc": '("santa catarina" OR "sc")',
-    "bahia": '("bahia" OR "ba")', "ba": '("bahia" OR "ba")',
-    "distrito federal": '("distrito federal" OR "df" OR "brasília")', "df": '("distrito federal" OR "df" OR "brasília")', "brasília": '("distrito federal" OR "df" OR "brasília")', "brasilia": '("distrito federal" OR "df" OR "brasília")',
-    "goiás": '("goiás" OR "go")', "goias": '("goiás" OR "go")', "go": '("goiás" OR "go")',
-    "mato grosso": '("mato grosso" OR "mt")', "mt": '("mato grosso" OR "mt")',
-    "mato grosso do sul": '("mato grosso do sul" OR "ms")', "ms": '("mato grosso do sul" OR "ms")',
-    "ceará": '("ceará" OR "ce")', "ceara": '("ceará" OR "ce")', "ce": '("ceará" OR "ce")',
-    "pernambuco": '("pernambuco" OR "pe")', "pe": '("pernambuco" OR "pe")',
-    "amazonas": '("amazonas" OR "am")', "am": '("amazonas" OR "am")',
-    "pará": '("pará" OR "pa")', "para": '("pará" OR "pa")', "pa": '("pará" OR "pa")',
-    "maranhão": '("maranhão" OR "ma")', "maranhao": '("maranhão" OR "ma")', "ma": '("maranhão" OR "ma")',
-    "paraíba": '("paraíba" OR "pb")', "paraiba": '("paraíba" OR "pb")', "pb": '("paraíba" OR "pb")',
-    "rio grande do norte": '("rio grande do norte" OR "rn")', "rn": '("rio grande do norte" OR "rn")',
-    "alagoas": '("alagoas" OR "al")', "al": '("alagoas" OR "al")',
-    "sergipe": '("sergipe" OR "se")', "se": '("sergipe" OR "se")',
-    "piauí": '("piauí" OR "pi")', "piaui": '("piauí" OR "pi")', "pi": '("piauí" OR "pi")',
-    "rondônia": '("rondônia" OR "ro")', "rondonia": '("rondônia" OR "ro")', "ro": '("rondônia" OR "ro")',
-    "tocantins": '("tocantins" OR "to")', "to": '("tocantins" OR "to")',
-    "acre": '("acre" OR "ac")', "ac": '("acre" OR "ac")',
-    "amapá": '("amapá" OR "ap")', "amapa": '("amapá" OR "ap")', "ap": '("amapá" OR "ap")',
-    "roraima": '("roraima" OR "rr")', "rr": '("roraima" OR "rr")'
-}
-
-def formatar_query_localizacao(localizacao_raw):
-    loc_clean = localizacao_raw.strip().lower()
-    if loc_clean in MAPEAMENTO_ESTADOS:
-        return MAPEAMENTO_ESTADOS[loc_clean]
+def formatar_localizacao_query(loc_raw):
+    """
+    Trata o texto da localização (cidade ou estado) para a busca no Google não zerar.
+    Exemplo: 'Campinas, SP' -> '("Campinas" OR "Campinas, SP")'
+    Exemplo: 'Curitiba' -> '"Curitiba"'
+    """
+    loc_limpa = loc_raw.strip()
+    if "," in loc_limpa:
+        partes = [p.strip() for p in loc_limpa.split(",") if p.strip()]
+        cidade = partes[0]
+        return f'("{cidade}" OR "{loc_limpa}")'
+    elif "-" in loc_limpa:
+        partes = [p.strip() for p in loc_limpa.split("-") if p.strip()]
+        cidade = partes[0]
+        return f'("{cidade}" OR "{loc_limpa}")'
     
-    cidade = localizacao_raw.strip()
-    return f'("{cidade}" OR "Região de {cidade}")'
+    return f'"{loc_limpa}"'
 
 def extrair_nome_e_cargo(titulo_google):
     if not titulo_google:
         return "Candidato", "Não informado"
     
-    titulo_limpo = re.sub(r"\s*\|\s*LinkedIn.*$", "", titulo_google, flags=re.IGNORECASE)
+    titulo_limpo = re.sub(r"\s*\|\s*LinkedIn.*$", "", str(titulo_google), flags=re.IGNORECASE)
     titulo_limpo = re.sub(r"\s*-\s*LinkedIn.*$", "", titulo_limpo, flags=re.IGNORECASE)
     
     partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
@@ -86,7 +64,7 @@ def enriquecer_contato_apollo(linkedin_url):
     }
 
     try:
-        res = requests.post(url_match, headers=HEADERS_APOLLO, json=payload, timeout=10)
+        res = requests.post(url_match, headers=HEADERS_APOLLO, json=payload, timeout=5)
         if res.status_code == 200:
             person = res.json().get("person") or {}
             email = person.get("email") or "Não disponível"
@@ -97,7 +75,7 @@ def enriquecer_contato_apollo(linkedin_url):
                 telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
             elif person.get("sanitized_phone_number"):
                 telefone = person.get("sanitized_phone_number")
-
+                
             return email, telefone
     except Exception:
         pass
@@ -112,7 +90,7 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     if not cargos_lista:
         return [], "Por favor, informe ao menos um cargo."
 
-    loc_query = formatar_query_localizacao(localizacao)
+    loc_query = formatar_localizacao_query(localizacao)
 
     queries_lista = []
     for cargo in cargos_lista:
@@ -122,19 +100,16 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
 
     query_final_str = "\n".join(queries_lista)
     
-    # Calcula dinamicamente quantas páginas do Google precisam ser raspadas
-    max_paginas = max(2, math.ceil(limite / 10) + 1)
-
     apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
     payload = {
         "queries": query_final_str,
-        "maxPagesPerQuery": max_paginas,
+        "maxPagesPerQuery": 2,
         "resultsPerPage": 20
     }
 
     try:
-        res = requests.post(apify_url, json=payload, timeout=120)
+        res = requests.post(apify_url, json=payload, timeout=45)
         
         if res.status_code not in (200, 201):
             return [], f"Apify retornou erro ({res.status_code}): {res.text}"
@@ -151,17 +126,18 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
             
             for item in organics:
                 url_perfil = item.get("url", "")
-                titulo_item = item.get("title", "")
                 
                 if "/in/" not in url_perfil or url_perfil in urls_vistas:
                     continue
 
                 urls_vistas.add(url_perfil)
 
+                titulo_item = item.get("title", "")
                 nome, cargo_extraido = extrair_nome_e_cargo(titulo_item)
+                
                 cargo_final = cargo_extraido if cargo_extraido != "Não informado" else cargos_lista[0]
 
-                # Enriquecimento de contato via Apollo
+                # Enriquecimento de e-mail e telefone via Apollo
                 email, telefone = enriquecer_contato_apollo(url_perfil)
 
                 candidatos.append({
@@ -180,7 +156,7 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
                 break
 
         if not candidatos:
-            return [], f"Nenhum perfil encontrado para os cargos informados em '{localizacao}'."
+            return [], f"Nenhum perfil encontrado no LinkedIn para '{cargos_raw}' em '{localizacao}'."
 
         return candidatos, None
 
@@ -239,7 +215,7 @@ HTML_TEMPLATE = """
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-300 mb-1">Localização (Cidade ou Estado):</label>
-                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: Campinas, SP, Rio de Janeiro, Curitiba" 
+                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: Campinas, Curitiba, Rio de Janeiro, SP" 
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
             </div>
@@ -301,13 +277,6 @@ HTML_TEMPLATE = """
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ cargo: cargo, localizacao: localizacao, limite: limite })
                 });
-
-                // Captura se o servidor respondeu com erro HTML (ex: 500, 503, 504)
-                if (!response.ok) {
-                    const erroTexto = await response.text();
-                    throw new Error(`Erro ${response.status} no servidor: ${erroTexto.substring(0, 150)}`);
-                }
-
                 const data = await response.json();
                 
                 loading.classList.add('hidden');
@@ -359,7 +328,7 @@ HTML_TEMPLATE = """
             } catch (err) {
                 loading.classList.add('hidden');
                 resultadoContainer.classList.remove('hidden');
-                logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-circle-exclamation"></i> ${err.message}</p>`;
+                logList.innerHTML = `<p class="text-rose-500">Erro na requisição: ${err.message}</p>`;
             } finally {
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
