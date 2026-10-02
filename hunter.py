@@ -20,31 +20,20 @@ HEADERS_APOLLO = {
     "x-api-key": APOLLO_API_KEY,
 }
 
-def extrair_nome_e_cargo(titulo_google, origem="LinkedIn"):
+def extrair_nome_e_cargo(titulo_google):
     """
-    Trata os títulos retornados pelo Google Search para extrair Nome e Cargo.
-    Ajustado para lidar com o formato específico do LinkedIn e da Catho.
+    Extrai Nome e Cargo dos títulos do LinkedIn retornados pelo Google.
+    Exemplo: "João Silva - Gerente de RH - Empresa | LinkedIn" -> Nome: "João Silva", Cargo: "Gerente de RH"
     """
     if not titulo_google:
         return "Candidato", "Não informado"
     
-    # Limpa marcações de fim de página
-    titulo_limpo = re.sub(r"\s*\|\s*(LinkedIn|Catho).*$", "", titulo_google, flags=re.IGNORECASE)
-    titulo_limpo = re.sub(r"\s*-\s*(LinkedIn|Catho).*$", "", titulo_limpo, flags=re.IGNORECASE)
+    # Limpa marcações de fim de página do LinkedIn
+    titulo_limpo = re.sub(r"\s*\|\s*LinkedIn.*$", "", titulo_google, flags=re.IGNORECASE)
+    titulo_limpo = re.sub(r"\s*-\s*LinkedIn.*$", "", titulo_limpo, flags=re.IGNORECASE)
     
-    if origem == "Catho":
-        # Formato comum Catho: "Currículo de Gerente de RH em São Paulo, SP"
-        titulo_limpo = re.sub(r"^(Currículo de|Perfil de|Candidato:?)\s*", "", titulo_limpo, flags=re.IGNORECASE)
-        partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
-        first_part = partes[0].strip()
-        
-        if " em " in first_part.lower():
-            cargo = re.split(r"\s+em\s+", first_part, flags=re.IGNORECASE)[0].strip()
-            return "Candidato (Catho)", cargo
-        return "Candidato (Catho)", first_part
-
-    # Formato LinkedIn: "João Silva - Gerente de RH - Empresa"
     partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
+    
     nome = partes[0].strip() if len(partes) > 0 else "Candidato"
     cargo = partes[1].strip() if len(partes) > 1 else "Não informado"
     
@@ -83,42 +72,6 @@ def enriquecer_contato_apollo(linkedin_url):
 
     return "Não disponível", "Não disponível"
 
-def enriquecer_por_nome_apollo(nome, cargo):
-    """
-    Busca E-mail e Telefone no Apollo usando Nome + Cargo (para perfis da Catho).
-    """
-    if not APOLLO_API_KEY or not nome or "Candidato" in nome:
-        return "Não disponível", "Não disponível"
-
-    url_search = "https://api.apollo.io/v1/mixed_people/api_search"
-    payload = {
-        "api_key": APOLLO_API_KEY,
-        "q_keywords": f'"{nome}" "{cargo}"',
-        "page": 1,
-        "per_page": 1
-    }
-
-    try:
-        res = requests.post(url_search, headers=HEADERS_APOLLO, json=payload, timeout=10)
-        if res.status_code == 200:
-            pessoas = res.json().get("people") or []
-            if pessoas:
-                p = pessoas[0]
-                email = p.get("email") or "Não disponível"
-                telefone = "Não disponível"
-                
-                phones = p.get("phone_numbers") or []
-                if phones and isinstance(phones, list) and len(phones) > 0:
-                    telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
-                elif p.get("sanitized_phone_number"):
-                    telefone = p.get("sanitized_phone_number")
-                    
-                return email, telefone
-    except Exception:
-        pass
-
-    return "Não disponível", "Não disponível"
-
 def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     if not APIFY_TOKEN:
         return [], "ERRO CRÍTICO: Token do Apify ausente (APIFY_TOKEN). Verifique seu arquivo .env!"
@@ -127,14 +80,11 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
     if not cargos_lista:
         return [], "Por favor, informe ao menos um cargo."
 
-    # Gera buscas individuais para LinkedIn e Catho para cada cargo
+    # Queries focadas no LinkedIn por Cargo + Localidade
     queries_lista = []
     for cargo in cargos_lista:
         queries_lista.append(
             f'site:linkedin.com/in/ "{cargo}" "{localizacao}"'
-        )
-        queries_lista.append(
-            f'site:catho.com.br "{cargo}" "{localizacao}"'
         )
 
     query_final_str = "\n".join(queries_lista)
@@ -166,35 +116,23 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
             for item in organics:
                 url_perfil = item.get("url", "")
                 
-                if url_perfil in urls_vistas:
-                    continue
-
-                origem = ""
-                if "/in/" in url_perfil:
-                    origem = "LinkedIn"
-                elif "catho.com.br" in url_perfil:
-                    origem = "Catho"
-                else:
+                if "/in/" not in url_perfil or url_perfil in urls_vistas:
                     continue
 
                 urls_vistas.add(url_perfil)
 
                 titulo_item = item.get("title", "")
-                nome, cargo_extraido = extrair_nome_e_cargo(titulo_item, origem=origem)
+                nome, cargo_extraido = extrair_nome_e_cargo(titulo_item)
                 
                 cargo_final = cargo_extraido if cargo_extraido != "Não informado" else cargos_lista[0]
 
-                # Enriquecimento de contato
-                if origem == "LinkedIn":
-                    email, telefone = enriquecer_contato_apollo(url_perfil)
-                else:
-                    email, telefone = enriquecer_por_nome_apollo(nome, cargo_final)
+                # Enriquecimento de e-mail e telefone via Apollo
+                email, telefone = enriquecer_contato_apollo(url_perfil)
 
                 candidatos.append({
                     "nome": nome,
                     "cargo": cargo_final,
                     "localizacao": localizacao,
-                    "origem": origem,
                     "email": email,
                     "telefone": telefone,
                     "link": url_perfil
@@ -207,7 +145,7 @@ def buscar_candidatos_apify(cargos_raw, localizacao, limite=20):
                 break
 
         if not candidatos:
-            return [], f"Nenhum perfil encontrado para os cargos '{cargos_raw}' na região '{localizacao}'."
+            return [], f"Nenhum perfil encontrado no LinkedIn para '{cargos_raw}' em '{localizacao}'."
 
         return candidatos, None
 
@@ -241,7 +179,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Start RH - Busca</title>
+    <title>Start RH - Busca: Perfis Dentro do Esperado</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 </head>
@@ -251,9 +189,9 @@ HTML_TEMPLATE = """
         <div class="flex items-center justify-between border-b border-gray-700 pb-6 mb-6">
             <div>
                 <h1 class="text-2xl font-bold text-amber-500">
-                    Busca
+                    Busca: Perfis Dentro do Esperado
                 </h1>
-                <p class="text-sm text-gray-400 mt-1">Pesquise múltiplos cargos no LinkedIn e na Catho em tempo real via Apify.</p>
+                <p class="text-sm text-gray-400 mt-1">Pesquise perfis no LinkedIn em tempo real via Apify.</p>
             </div>
         </div>
 
@@ -287,7 +225,7 @@ HTML_TEMPLATE = """
 
         <div id="loading" class="hidden my-8 text-center">
             <div class="inline-block animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
-            <p class="text-gray-400 text-sm mt-3 animate-pulse">Varrendo LinkedIn & Catho e cruzando telefones/e-mails no Apollo...</p>
+            <p class="text-gray-400 text-sm mt-3 animate-pulse">Varrendo LinkedIn e cruzando telefones/e-mails no Apollo...</p>
         </div>
 
         <div id="resultadoContainer" class="hidden mt-8 border-t border-gray-700 pt-6">
@@ -349,16 +287,12 @@ HTML_TEMPLATE = """
                                             <th class="p-3">Localização</th>
                                             <th class="p-3">E-mail</th>
                                             <th class="p-3">Telefone</th>
-                                            <th class="p-3 text-center">Fonte</th>
+                                            <th class="p-3 text-center">LinkedIn</th>
                                         </tr>
                                     </thead>
                                     <tbody class="divide-y divide-gray-700 bg-gray-800/50">`;
 
                         data.contatos.forEach(c => {
-                            const badgeColor = c.origem === 'LinkedIn' 
-                                ? 'bg-blue-600/20 text-blue-400 border-blue-500/30' 
-                                : 'bg-rose-600/20 text-rose-400 border-rose-500/30';
-
                             tableHtml += `
                                 <tr class="hover:bg-gray-800 transition">
                                     <td class="p-3 font-semibold text-gray-100">${c.nome}</td>
@@ -367,8 +301,8 @@ HTML_TEMPLATE = """
                                     <td class="p-3 font-mono text-xs text-amber-300/90">${c.email}</td>
                                     <td class="p-3 font-mono text-xs text-emerald-400">${c.telefone}</td>
                                     <td class="p-3 text-center">
-                                        <a href="${c.link}" target="_blank" class="inline-flex items-center gap-1 border px-2 py-1 rounded text-xs transition ${badgeColor}">
-                                            ${c.origem} <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
+                                        <a href="${c.link}" target="_blank" class="inline-flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-3 py-1 rounded text-xs transition">
+                                            LinkedIn <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
                                         </a>
                                     </td>
                                 </tr>`;
