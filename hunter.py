@@ -81,8 +81,8 @@ def buscar_perfis_google(cargo, localizacao, limite):
         "queries": query,
         "maxPagesPerQuery": paginas,
         "resultsPerPage": 10,
-        "countryCode": "br",   # resultados do Google Brasil
-        "languageCode": "pt",  # interface em português
+        "countryCode": "br",     # resultados do Google Brasil
+        "languageCode": "pt-BR", # interface em português (Brasil)
     }
 
     url = "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items"
