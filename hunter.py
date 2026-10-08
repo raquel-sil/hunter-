@@ -1,5 +1,4 @@
 import hmac
-import math
 import os
 import re
 import unicodedata
@@ -15,6 +14,9 @@ APP_USER = os.getenv("APP_USER", "")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
 APIFY_URL = "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items"
+
+# Quantas páginas do Google buscar por consulta (cada página traz ~10 resultados)
+MAX_PAGINAS = 30
 
 # Sinais de Open to Work (já normalizados: sem acento, minúsculo, sem #)
 SINAIS_OPEN_TO_WORK = ("open to work", "opentowork", "buscando oportunidade")
@@ -43,10 +45,28 @@ def e_open_to_work(texto):
 
 
 def bate_localizacao_exata(texto, termos):
-    """Exige a localização inteira como expressão (não basta 'SP' dentro de outra palavra)."""
+    """
+    Aceita só quando a cidade aparece como localização atual do perfil,
+    e não como experiência passada ou formação.
+    """
     if not termos:
         return True
-    return any(re.search(r"\b" + re.escape(t) + r"\b", texto) for t in termos)
+
+    palavras_passado = r"\b(ex|anterior|anteriormente|antes|previamente|trabalhou|formado|formou|estudou|desde)\b"
+
+    for t in termos:
+        padrao = (
+            r"(?:^|[·|\-–•,]|\bem\b)\s*"                          # antes: início, separador ou "em"
+            + re.escape(t)
+            + r"(?=\s*(?:,|·|\||-|–|•|\.|$|\bbrasil\b|\bbrazil\b))"  # depois: separador, fim ou país
+        )
+        for m in re.finditer(padrao, texto):
+            contexto_antes = texto[max(0, m.start() - 30):m.start()]
+            if re.search(palavras_passado, contexto_antes):
+                continue
+            return True
+
+    return False
 
 
 def extrair_nome_de_titulo(titulo_google):
@@ -65,7 +85,7 @@ def buscar_candidatos(cargo, localizacao, limite=20):
 
     termos = termos_localizacao(localizacao)
 
-    # Query: perfis do LinkedIn + cargo + localização exata + sinal de Open to Work
+    # Query: perfis do LinkedIn + cargo + localização + sinal de Open to Work
     clausula_loc = ""
     if termos:
         partes = [p.strip() for p in localizacao.split(",") if p.strip()]
@@ -76,8 +96,8 @@ def buscar_candidatos(cargo, localizacao, limite=20):
         f'("open to work" OR "#opentowork" OR "buscando oportunidade")'
     )
 
-    # Mais páginas porque os filtros estritos descartam bastante coisa
-    paginas = min(5, max(1, math.ceil(limite * 3 / 10)))
+    # Busca em várias páginas, porque os filtros estritos descartam bastante coisa
+    paginas = MAX_PAGINAS
 
     payload = {
         "queries": query,
@@ -88,7 +108,7 @@ def buscar_candidatos(cargo, localizacao, limite=20):
     }
 
     try:
-        res = requests.post(APIFY_URL, params={"token": APIFY_TOKEN}, json=payload, timeout=180)
+        res = requests.post(APIFY_URL, params={"token": APIFY_TOKEN}, json=payload, timeout=300)
     except Exception as e:
         return [], f"Falha ao conectar com Apify: {e}"
 
