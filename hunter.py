@@ -3,7 +3,6 @@ import math
 import os
 import re
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, Response, render_template_string, request, jsonify
 import requests
@@ -12,19 +11,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
-APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "")
 APP_USER = os.getenv("APP_USER", "")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
-# True  -> só retorna perfis cuja localização aparece no título/snippet/URL
-# False -> retorna todos os perfis encontrados, mesmo sem a localização confirmada
-EXIGIR_LOCALIZACAO = True
+APIFY_URL = "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items"
 
-HEADERS_APOLLO = {
-    "Cache-Control": "no-cache",
-    "Content-Type": "application/json",
-    "x-api-key": APOLLO_API_KEY,
-}
+# Sinais de Open to Work (já normalizados: sem acento, minúsculo, sem #)
+SINAIS_OPEN_TO_WORK = ("open to work", "opentowork", "buscando oportunidade")
 
 
 def normalizar(texto):
@@ -35,58 +28,69 @@ def normalizar(texto):
 
 
 def termos_localizacao(localizacao):
-    """'São Paulo, SP' -> ['sao paulo', 'sp']"""
+    """'São Paulo, Rio de Janeiro' -> ['sao paulo', 'rio de janeiro']"""
     return [normalizar(p) for p in (localizacao or "").split(",") if normalizar(p)]
 
 
-def bate_localizacao(item, termos):
-    """Verifica se algum termo da localização aparece no resultado (com limite de palavra)."""
+def texto_do_resultado(item):
+    """Título + snippet do resultado, normalizado e sem '#'."""
+    bruto = f"{item.get('title', '')} {item.get('description', '')}"
+    return normalizar(bruto).replace("#", "")
+
+
+def e_open_to_work(texto):
+    return any(sinal in texto for sinal in SINAIS_OPEN_TO_WORK)
+
+
+def bate_localizacao_exata(texto, termos):
+    """Exige a localização inteira como expressão (não basta 'SP' dentro de outra palavra)."""
     if not termos:
         return True
-    texto = normalizar(f"{item.get('title', '')} {item.get('description', '')} {item.get('url', '')}")
     return any(re.search(r"\b" + re.escape(t) + r"\b", texto) for t in termos)
 
 
 def extrair_nome_de_titulo(titulo_google):
-    """
-    Exemplo: "João Silva - Gerente de RH - Empresa | LinkedIn" -> "João Silva"
-    """
+    """Exemplo: 'João Silva - Gerente de RH - Empresa | LinkedIn' -> 'João Silva'"""
     if not titulo_google:
         return "Candidato"
-    titulo_limpo = re.sub(r"\s*\|\s*LinkedIn.*$", "", titulo_google, flags=re.IGNORECASE)
-    titulo_limpo = re.sub(r"\s*-\s*LinkedIn.*$", "", titulo_limpo, flags=re.IGNORECASE)
-    partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
+    limpo = re.sub(r"\s*\|\s*LinkedIn.*$", "", titulo_google, flags=re.IGNORECASE)
+    limpo = re.sub(r"\s*-\s*LinkedIn.*$", "", limpo, flags=re.IGNORECASE)
+    partes = re.split(r"\s*[\-\|–]\s*", limpo)
     return partes[0].strip() if partes and partes[0].strip() else "Candidato"
 
 
-def buscar_perfis_google(cargo, localizacao, limite):
-    """Busca perfis no LinkedIn via Apify (Google Search Scraper) e filtra pela localização."""
+def buscar_candidatos(cargo, localizacao, limite=20):
+    if not APIFY_TOKEN:
+        return [], "ERRO CRÍTICO: Token do Apify ausente (APIFY_TOKEN). Verifique seu arquivo .env!"
+
     termos = termos_localizacao(localizacao)
 
-    # Monta a query: cargo + localização (variantes) + sinais de "open to work"
+    # Query: perfis do LinkedIn + cargo + localização exata + sinal de Open to Work
     clausula_loc = ""
     if termos:
-        partes_loc = [p.strip() for p in localizacao.split(",") if p.strip()]
-        clausula_loc = " (" + " OR ".join(f'"{p}"' for p in partes_loc) + ")"
+        partes = [p.strip() for p in localizacao.split(",") if p.strip()]
+        clausula_loc = " (" + " OR ".join(f'"{p}"' for p in partes) + ")"
 
     query = (
         f'site:linkedin.com/in/ "{cargo}"{clausula_loc} '
         f'("open to work" OR "#opentowork" OR "buscando oportunidade")'
     )
 
-    # Busca mais resultados do que o necessário, porque o filtro de localização descarta alguns
+    # Mais páginas porque os filtros estritos descartam bastante coisa
     paginas = min(5, max(1, math.ceil(limite * 3 / 10)))
 
     payload = {
         "queries": query,
         "maxPagesPerQuery": paginas,
         "resultsPerPage": 10,
-        "countryCode": "br",     # resultados do Google Brasil
-        "languageCode": "pt-BR", # interface em português (Brasil)
+        "countryCode": "br",
+        "languageCode": "pt-BR",
     }
 
-    url = "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items"
-    res = requests.post(url, params={"token": APIFY_TOKEN}, json=payload, timeout=180)
+    try:
+        res = requests.post(APIFY_URL, params={"token": APIFY_TOKEN}, json=payload, timeout=180)
+    except Exception as e:
+        return [], f"Falha ao conectar com Apify: {e}"
 
     if res.status_code not in (200, 201):
         return [], f"Apify retornou erro ({res.status_code}): {res.text}"
@@ -97,95 +101,33 @@ def buscar_perfis_google(cargo, localizacao, limite):
 
     organics = [o for item in dataset for o in (item.get("organicResults") or [])]
 
-    candidatos, vistos = [], set()
+    contatos, vistos = [], set()
     for o in organics:
         url_linkedin = o.get("url", "")
         if "linkedin.com/in/" not in url_linkedin or url_linkedin in vistos:
             continue
-        if EXIGIR_LOCALIZACAO and not bate_localizacao(o, termos):
+
+        texto = texto_do_resultado(o)
+        if not e_open_to_work(texto):
+            continue
+        if not bate_localizacao_exata(texto, termos):
             continue
 
         vistos.add(url_linkedin)
-        candidatos.append({
+        contatos.append({
             "nome": extrair_nome_de_titulo(o.get("title", "")),
+            "cargo": cargo,
+            "localizacao": localizacao,
             "linkedin": url_linkedin,
         })
-        if len(candidatos) >= limite:
+        if len(contatos) >= limite:
             break
 
-    if not candidatos:
+    if not contatos:
         msg = f"Nenhum perfil 'Open to Work' encontrado para '{cargo}'"
         if localizacao:
             msg += f" em '{localizacao}'"
         return [], msg + "."
-
-    return candidatos, None
-
-
-def enriquecer_contato_apollo(linkedin_url):
-    """Busca e-mail e telefone no Apollo a partir da URL do LinkedIn."""
-    if not APOLLO_API_KEY or not linkedin_url:
-        return "Não disponível", "Não disponível"
-
-    payload = {
-        "linkedin_url": linkedin_url,
-        "reveal_personal_emails": True,
-    }
-
-    try:
-        res = requests.post(
-            "https://api.apollo.io/v1/people/match",
-            headers=HEADERS_APOLLO,
-            json=payload,
-            timeout=15,
-        )
-        if res.status_code == 200:
-            person = res.json().get("person") or {}
-
-            email = person.get("email") or ""
-            if not email or "email_not_unlocked" in email:
-                email = "Não disponível"
-
-            telefone = "Não disponível"
-            phones = person.get("phone_numbers") or []
-            if phones:
-                telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or telefone
-            elif person.get("sanitized_phone_number"):
-                telefone = person["sanitized_phone_number"]
-
-            return email, telefone
-    except Exception:
-        pass
-
-    return "Não disponível", "Não disponível"
-
-
-def buscar_candidatos(cargo, localizacao, limite=20):
-    if not APIFY_TOKEN:
-        return [], "ERRO CRÍTICO: Token do Apify ausente (APIFY_TOKEN). Verifique seu arquivo .env!"
-
-    try:
-        candidatos, erro = buscar_perfis_google(cargo, localizacao, limite)
-    except Exception as e:
-        return [], f"Falha ao conectar com Apify: {e}"
-
-    if erro or not candidatos:
-        return [], erro
-
-    # Enriquecimento em paralelo (mais rápido que um por vez)
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        contatos_info = list(executor.map(lambda c: enriquecer_contato_apollo(c["linkedin"]), candidatos))
-
-    contatos = []
-    for c, (email, telefone) in zip(candidatos, contatos_info):
-        contatos.append({
-            "nome": c["nome"],
-            "cargo": cargo,
-            "localizacao": localizacao,
-            "email": email,
-            "telefone": telefone,
-            "linkedin": c["linkedin"],
-        })
 
     return contatos, None
 
@@ -226,13 +168,11 @@ HTML_TEMPLATE = """
 <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col items-center p-6">
     <div class="max-w-5xl w-full bg-gray-800 rounded-xl shadow-2xl border border-gray-700 p-8 mt-6">
 
-        <div class="flex items-center justify-between border-b border-gray-700 pb-6 mb-6">
-            <div>
-                <h1 class="text-2xl font-bold text-amber-500 flex items-center gap-2">
-                    <i class="fa-solid fa-spider"></i> Busca Apify: Candidatos "Open To Work"
-                </h1>
-                <p class="text-sm text-gray-400 mt-1">Varredura em tempo real via Apify + Enriquecimento de Contato (E-mail e Telefone).</p>
-            </div>
+        <div class="border-b border-gray-700 pb-6 mb-6">
+            <h1 class="text-2xl font-bold text-amber-500 flex items-center gap-2">
+                <i class="fa-solid fa-spider"></i> Busca Apify: Candidatos "Open To Work"
+            </h1>
+            <p class="text-sm text-gray-400 mt-1">Perfis do LinkedIn com Open to Work na localização informada.</p>
         </div>
 
         <div class="space-y-4">
@@ -244,15 +184,13 @@ HTML_TEMPLATE = """
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-300 mb-1">Localização do Candidato:</label>
-                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: São Paulo, Rio de Janeiro, Curitiba"
+                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: São Paulo, Rio de Janeiro"
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
             </div>
 
             <div>
-                <label class="block text-sm font-medium text-gray-300 mb-1">
-                    Quantidade máxima de candidatos:
-                </label>
+                <label class="block text-sm font-medium text-gray-300 mb-1">Quantidade máxima de candidatos:</label>
                 <input type="number" id="limiteInput" value="20" min="1" max="50"
                     class="w-32 bg-gray-900 border border-gray-700 rounded-lg p-2 text-gray-100 focus:outline-none focus:border-amber-500 transition font-mono text-sm">
             </div>
@@ -265,7 +203,7 @@ HTML_TEMPLATE = """
 
         <div id="loading" class="hidden my-8 text-center">
             <div class="inline-block animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
-            <p class="text-gray-400 text-sm mt-3 animate-pulse">Executando Actor do Apify e enriquecendo dados de contato...</p>
+            <p class="text-gray-400 text-sm mt-3 animate-pulse">Executando busca no Apify...</p>
         </div>
 
         <div id="resultadoContainer" class="hidden mt-8 border-t border-gray-700 pt-6">
@@ -275,7 +213,6 @@ HTML_TEMPLATE = """
                 </h2>
                 <span id="totalBadge" class="bg-amber-500/10 text-amber-400 text-xs px-3 py-1 rounded-full border border-amber-500/20 font-mono"></span>
             </div>
-
             <div id="logList" class="space-y-3 font-sans text-sm"></div>
         </div>
     </div>
@@ -331,8 +268,6 @@ HTML_TEMPLATE = """
                                             <th class="p-3">Nome</th>
                                             <th class="p-3">Cargo Buscado</th>
                                             <th class="p-3">Localização</th>
-                                            <th class="p-3">E-mail</th>
-                                            <th class="p-3">Telefone</th>
                                             <th class="p-3 text-center">LinkedIn</th>
                                         </tr>
                                     </thead>
@@ -344,12 +279,8 @@ HTML_TEMPLATE = """
                                     <td class="p-3 font-semibold text-gray-100">${esc(c.nome)}</td>
                                     <td class="p-3 text-gray-300">${esc(c.cargo)}</td>
                                     <td class="p-3 text-gray-300">${esc(c.localizacao)}</td>
-                                    <td class="p-3 font-mono text-xs text-amber-300/90">${esc(c.email)}</td>
-                                    <td class="p-3 font-mono text-xs text-emerald-400">${esc(c.telefone)}</td>
                                     <td class="p-3 text-center">
-                                        ${c.linkedin
-                                            ? `<a href="${esc(c.linkedin)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-3 py-1 rounded-md text-xs transition"><i class="fa-brands fa-linkedin"></i> Ver Perfil</a>`
-                                            : '<span class="text-gray-500 text-xs">N/A</span>'}
+                                        <a href="${esc(c.linkedin)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-3 py-1 rounded-md text-xs transition"><i class="fa-brands fa-linkedin"></i> Ver Perfil</a>
                                     </td>
                                 </tr>`;
                         });
