@@ -1,18 +1,24 @@
 import hmac
+import math
 import os
 import re
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+
 from flask import Flask, Response, render_template_string, request, jsonify
 import requests
 from dotenv import load_dotenv
 
-# Carrega as variáveis do arquivo .env
 load_dotenv()
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "")
-
 APP_USER = os.getenv("APP_USER", "")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+
+# True  -> só retorna perfis cuja localização aparece no título/snippet/URL
+# False -> retorna todos os perfis encontrados, mesmo sem a localização confirmada
+EXIGIR_LOCALIZACAO = True
 
 HEADERS_APOLLO = {
     "Cache-Control": "no-cache",
@@ -20,127 +26,179 @@ HEADERS_APOLLO = {
     "x-api-key": APOLLO_API_KEY,
 }
 
+
+def normalizar(texto):
+    """Remove acentos e deixa minúsculo: 'São Paulo' -> 'sao paulo'."""
+    texto = unicodedata.normalize("NFKD", texto or "")
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", texto).lower().strip()
+
+
+def termos_localizacao(localizacao):
+    """'São Paulo, SP' -> ['sao paulo', 'sp']"""
+    return [normalizar(p) for p in (localizacao or "").split(",") if normalizar(p)]
+
+
+def bate_localizacao(item, termos):
+    """Verifica se algum termo da localização aparece no resultado (com limite de palavra)."""
+    if not termos:
+        return True
+    texto = normalizar(f"{item.get('title', '')} {item.get('description', '')} {item.get('url', '')}")
+    return any(re.search(r"\b" + re.escape(t) + r"\b", texto) for t in termos)
+
+
 def extrair_nome_de_titulo(titulo_google):
     """
-    Limpa o título retornado pelo Google Search para extrair o Nome da pessoa.
     Exemplo: "João Silva - Gerente de RH - Empresa | LinkedIn" -> "João Silva"
     """
     if not titulo_google:
         return "Candidato"
-    
-    # Remove marcas padrão do LinkedIn do final
     titulo_limpo = re.sub(r"\s*\|\s*LinkedIn.*$", "", titulo_google, flags=re.IGNORECASE)
     titulo_limpo = re.sub(r"\s*-\s*LinkedIn.*$", "", titulo_limpo, flags=re.IGNORECASE)
-    
-    # Pega a primeira parte antes do hífen ou travessão (normalmente onde fica o nome)
     partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
-    if partes:
-        return partes[0].strip()
-    return titulo_limpo.strip()
+    return partes[0].strip() if partes and partes[0].strip() else "Candidato"
+
+
+def buscar_perfis_google(cargo, localizacao, limite):
+    """Busca perfis no LinkedIn via Apify (Google Search Scraper) e filtra pela localização."""
+    termos = termos_localizacao(localizacao)
+
+    # Monta a query: cargo + localização (variantes) + sinais de "open to work"
+    clausula_loc = ""
+    if termos:
+        partes_loc = [p.strip() for p in localizacao.split(",") if p.strip()]
+        clausula_loc = " (" + " OR ".join(f'"{p}"' for p in partes_loc) + ")"
+
+    query = (
+        f'site:linkedin.com/in/ "{cargo}"{clausula_loc} '
+        f'("open to work" OR "#opentowork" OR "buscando oportunidade")'
+    )
+
+    # Busca mais resultados do que o necessário, porque o filtro de localização descarta alguns
+    paginas = min(5, max(1, math.ceil(limite * 3 / 10)))
+
+    payload = {
+        "queries": query,
+        "maxPagesPerQuery": paginas,
+        "resultsPerPage": 10,
+        "countryCode": "br",   # resultados do Google Brasil
+        "languageCode": "pt",  # interface em português
+    }
+
+    url = "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items"
+    res = requests.post(url, params={"token": APIFY_TOKEN}, json=payload, timeout=180)
+
+    if res.status_code not in (200, 201):
+        return [], f"Apify retornou erro ({res.status_code}): {res.text}"
+
+    dataset = res.json()
+    if not dataset or not isinstance(dataset, list):
+        return [], f"Nenhum resultado retornado pelo Apify para '{cargo}'."
+
+    organics = [o for item in dataset for o in (item.get("organicResults") or [])]
+
+    candidatos, vistos = [], set()
+    for o in organics:
+        url_linkedin = o.get("url", "")
+        if "linkedin.com/in/" not in url_linkedin or url_linkedin in vistos:
+            continue
+        if EXIGIR_LOCALIZACAO and not bate_localizacao(o, termos):
+            continue
+
+        vistos.add(url_linkedin)
+        candidatos.append({
+            "nome": extrair_nome_de_titulo(o.get("title", "")),
+            "linkedin": url_linkedin,
+        })
+        if len(candidatos) >= limite:
+            break
+
+    if not candidatos:
+        msg = f"Nenhum perfil 'Open to Work' encontrado para '{cargo}'"
+        if localizacao:
+            msg += f" em '{localizacao}'"
+        return [], msg + "."
+
+    return candidatos, None
+
 
 def enriquecer_contato_apollo(linkedin_url):
-    """
-    Usa o Apollo para buscar o e-mail e telefone a partir da URL do LinkedIn.
-    """
+    """Busca e-mail e telefone no Apollo a partir da URL do LinkedIn."""
     if not APOLLO_API_KEY or not linkedin_url:
         return "Não disponível", "Não disponível"
 
-    url_match = "https://api.apollo.io/v1/people/match"
     payload = {
-        "api_key": APOLLO_API_KEY,
-        "details_api_key": APOLLO_API_KEY,
-        "linkedin_url": linkedin_url
+        "linkedin_url": linkedin_url,
+        "reveal_personal_emails": True,
     }
 
     try:
-        res = requests.post(url_match, headers=HEADERS_APOLLO, json=payload, timeout=10)
+        res = requests.post(
+            "https://api.apollo.io/v1/people/match",
+            headers=HEADERS_APOLLO,
+            json=payload,
+            timeout=15,
+        )
         if res.status_code == 200:
             person = res.json().get("person") or {}
-            email = person.get("email") or "Não disponível"
-            
-            # Busca de telefone
+
+            email = person.get("email") or ""
+            if not email or "email_not_unlocked" in email:
+                email = "Não disponível"
+
             telefone = "Não disponível"
             phones = person.get("phone_numbers") or []
-            if phones and isinstance(phones, list) and len(phones) > 0:
-                telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
+            if phones:
+                telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or telefone
             elif person.get("sanitized_phone_number"):
-                telefone = person.get("sanitized_phone_number")
-                
+                telefone = person["sanitized_phone_number"]
+
             return email, telefone
     except Exception:
         pass
 
     return "Não disponível", "Não disponível"
 
-def buscar_candidatos_apify(cargo, localizacao, limite=20):
+
+def buscar_candidatos(cargo, localizacao, limite=20):
     if not APIFY_TOKEN:
         return [], "ERRO CRÍTICO: Token do Apify ausente (APIFY_TOKEN). Verifique seu arquivo .env!"
 
-    # Query X-Ray direcionada para perfis do LinkedIn Open To Work
-    query_search = f'site:linkedin.com/in/ "{cargo}" "{localizacao}" ("open to work" OR "#opentowork" OR "buscando oportunidade")'
-    
-    # Endpoint síncrono do Google Search Scraper no Apify
-    apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
-    
-    payload = {
-        "queries": query_search,
-        "maxPagesPerQuery": 1,
-        "resultsPerPage": min(limite, 50)
-    }
-
     try:
-        res = requests.post(apify_url, json=payload, timeout=60)
-        
-        if res.status_code not in (200, 201):
-            return [], f"Apify retornou erro ({res.status_code}): {res.text}"
-
-        dataset = res.json()
-        if not dataset or not isinstance(dataset, list):
-            return [], f"Nenhum resultado retornado pelo Apify para '{cargo}' em '{localizacao}'."
-
-        organics = dataset[0].get("organicResults") or []
-        
-        if not organics:
-            return [], f"Nenhum perfil 'Open to Work' encontrado no LinkedIn para '{cargo}' em '{localizacao}'."
-
-        candidatos = []
-        for item in organics:
-            url_linkedin = item.get("url", "")
-            
-            # Garante que é um link de perfil pessoal do LinkedIn
-            if "/in/" not in url_linkedin:
-                continue
-
-            titulo_item = item.get("title", "")
-            nome = extrair_nome_de_titulo(titulo_item)
-            
-            # Tenta enriquecer com E-mail e Telefone via Apollo usando a URL do LinkedIn
-            email, telefone = enriquecer_contato_apollo(url_linkedin)
-
-            candidatos.append({
-                "nome": nome,
-                "cargo": cargo,
-                "localizacao": localizacao,
-                "email": email,
-                "telefone": telefone,
-                "linkedin": url_linkedin
-            })
-
-            if len(candidatos) >= limite:
-                break
-
-        return candidatos, None
-
+        candidatos, erro = buscar_perfis_google(cargo, localizacao, limite)
     except Exception as e:
-        return [], f"Falha ao conectar com Apify: {str(e)}"
+        return [], f"Falha ao conectar com Apify: {e}"
+
+    if erro or not candidatos:
+        return [], erro
+
+    # Enriquecimento em paralelo (mais rápido que um por vez)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        contatos_info = list(executor.map(lambda c: enriquecer_contato_apollo(c["linkedin"]), candidatos))
+
+    contatos = []
+    for c, (email, telefone) in zip(candidatos, contatos_info):
+        contatos.append({
+            "nome": c["nome"],
+            "cargo": cargo,
+            "localizacao": localizacao,
+            "email": email,
+            "telefone": telefone,
+            "linkedin": c["linkedin"],
+        })
+
+    return contatos, None
 
 
 app = Flask(__name__)
 
+
 def _pedir_login():
     return Response(
-        "Acesso restrito.", 401, {"WWW-Authenticate": 'Basic realm="Start RH - Apify Candidate Search"'}
+        "Acesso restrito.", 401,
+        {"WWW-Authenticate": 'Basic realm="Start RH - Apify Candidate Search"'}
     )
+
 
 @app.before_request
 def exigir_login():
@@ -167,7 +225,7 @@ HTML_TEMPLATE = """
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col items-center p-6">
     <div class="max-w-5xl w-full bg-gray-800 rounded-xl shadow-2xl border border-gray-700 p-8 mt-6">
-        
+
         <div class="flex items-center justify-between border-b border-gray-700 pb-6 mb-6">
             <div>
                 <h1 class="text-2xl font-bold text-amber-500 flex items-center gap-2">
@@ -181,12 +239,12 @@ HTML_TEMPLATE = """
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                     <label class="block text-sm font-medium text-gray-300 mb-1">Cargo do Candidato:</label>
-                    <input type="text" id="cargoInput" placeholder="Ex: Gerente de RH, Desenvolvedor Python" 
+                    <input type="text" id="cargoInput" placeholder="Ex: Gerente de RH, Desenvolvedor Python"
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-300 mb-1">Localização do Candidato:</label>
-                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: São Paulo, Rio de Janeiro, Curitiba" 
+                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: São Paulo, Rio de Janeiro, Curitiba"
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
             </div>
@@ -199,7 +257,7 @@ HTML_TEMPLATE = """
                     class="w-32 bg-gray-900 border border-gray-700 rounded-lg p-2 text-gray-100 focus:outline-none focus:border-amber-500 transition font-mono text-sm">
             </div>
 
-            <button id="btnProcessar" onclick="processarHunting()" 
+            <button id="btnProcessar" onclick="processarHunting()"
                 class="w-full bg-amber-500 hover:bg-amber-600 text-gray-950 font-bold py-3 px-6 rounded-lg transition flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20">
                 <i class="fa-solid fa-magnifying-glass"></i> Buscar via Apify
             </button>
@@ -217,17 +275,23 @@ HTML_TEMPLATE = """
                 </h2>
                 <span id="totalBadge" class="bg-amber-500/10 text-amber-400 text-xs px-3 py-1 rounded-full border border-amber-500/20 font-mono"></span>
             </div>
-            
+
             <div id="logList" class="space-y-3 font-sans text-sm"></div>
         </div>
     </div>
 
     <script>
+        function esc(valor) {
+            const d = document.createElement('div');
+            d.textContent = valor ?? '';
+            return d.innerHTML;
+        }
+
         async function processarHunting() {
             const cargo = document.getElementById('cargoInput').value.trim();
             const localizacao = document.getElementById('localizacaoInput').value.trim();
             const limite = parseInt(document.getElementById('limiteInput').value) || 20;
-            
+
             if (!cargo) return alert('Por favor, informe o cargo.');
 
             const btn = document.getElementById('btnProcessar');
@@ -249,7 +313,7 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ cargo: cargo, localizacao: localizacao, limite: limite })
                 });
                 const data = await response.json();
-                
+
                 loading.classList.add('hidden');
                 resultadoContainer.classList.remove('hidden');
 
@@ -257,7 +321,7 @@ HTML_TEMPLATE = """
                     totalBadge.innerText = `${data.contatos.length} Candidato(s)`;
 
                     if (data.contatos.length === 0) {
-                        logList.innerHTML = `<p class="text-rose-400 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-triangle-exclamation"></i> <b>Aviso:</b> ${data.erro}</p>`;
+                        logList.innerHTML = `<p class="text-rose-400 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-triangle-exclamation"></i> <b>Aviso:</b> ${esc(data.erro)}</p>`;
                     } else {
                         let tableHtml = `
                             <div class="overflow-x-auto">
@@ -266,6 +330,7 @@ HTML_TEMPLATE = """
                                         <tr class="bg-gray-900 text-amber-400 border-b border-gray-700 text-xs uppercase font-mono">
                                             <th class="p-3">Nome</th>
                                             <th class="p-3">Cargo Buscado</th>
+                                            <th class="p-3">Localização</th>
                                             <th class="p-3">E-mail</th>
                                             <th class="p-3">Telefone</th>
                                             <th class="p-3 text-center">LinkedIn</th>
@@ -276,13 +341,14 @@ HTML_TEMPLATE = """
                         data.contatos.forEach(c => {
                             tableHtml += `
                                 <tr class="hover:bg-gray-800 transition">
-                                    <td class="p-3 font-semibold text-gray-100">${c.nome}</td>
-                                    <td class="p-3 text-gray-300">${c.cargo}</td>
-                                    <td class="p-3 font-mono text-xs text-amber-300/90">${c.email}</td>
-                                    <td class="p-3 font-mono text-xs text-emerald-400">${c.telefone}</td>
+                                    <td class="p-3 font-semibold text-gray-100">${esc(c.nome)}</td>
+                                    <td class="p-3 text-gray-300">${esc(c.cargo)}</td>
+                                    <td class="p-3 text-gray-300">${esc(c.localizacao)}</td>
+                                    <td class="p-3 font-mono text-xs text-amber-300/90">${esc(c.email)}</td>
+                                    <td class="p-3 font-mono text-xs text-emerald-400">${esc(c.telefone)}</td>
                                     <td class="p-3 text-center">
-                                        ${c.linkedin 
-                                            ? `<a href="${c.linkedin}" target="_blank" class="inline-flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-3 py-1 rounded-md text-xs transition"><i class="fa-brands fa-linkedin"></i> Ver Perfil</a>` 
+                                        ${c.linkedin
+                                            ? `<a href="${esc(c.linkedin)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-3 py-1 rounded-md text-xs transition"><i class="fa-brands fa-linkedin"></i> Ver Perfil</a>`
                                             : '<span class="text-gray-500 text-xs">N/A</span>'}
                                     </td>
                                 </tr>`;
@@ -292,12 +358,12 @@ HTML_TEMPLATE = """
                         logList.innerHTML = tableHtml;
                     }
                 } else {
-                    logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-bomb"></i> Erro no servidor: ${data.message}</p>`;
+                    logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-bomb"></i> Erro no servidor: ${esc(data.message)}</p>`;
                 }
             } catch (err) {
                 loading.classList.add('hidden');
                 resultadoContainer.classList.remove('hidden');
-                logList.innerHTML = `<p class="text-rose-500">Erro na requisição: ${err.message}</p>`;
+                logList.innerHTML = `<p class="text-rose-500">Erro na requisição: ${esc(err.message)}</p>`;
             } finally {
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -308,15 +374,17 @@ HTML_TEMPLATE = """
 </html>
 """
 
+
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+
 @app.route("/api/buscar_candidatos", methods=["POST"])
 def api_buscar_candidatos():
     data = request.json or {}
-    cargo = data.get("cargo", "").strip()
-    localizacao = data.get("localizacao", "").strip()
+    cargo = (data.get("cargo") or "").strip()
+    localizacao = (data.get("localizacao") or "").strip()
     try:
         limite = max(1, min(int(data.get("limite", 20)), 50))
     except (TypeError, ValueError):
@@ -325,15 +393,16 @@ def api_buscar_candidatos():
     if not cargo:
         return jsonify({"status": "error", "message": "O campo 'cargo' é obrigatório."}), 400
 
-    contatos, erro_apify = buscar_candidatos_apify(cargo, localizacao, limite=limite)
-    
+    contatos, erro = buscar_candidatos(cargo, localizacao, limite=limite)
+
     return jsonify({
         "status": "success",
         "cargo": cargo,
         "localizacao": localizacao,
         "contatos": contatos,
-        "erro": erro_apify
+        "erro": erro,
     })
+
 
 if __name__ == "__main__":
     porta = int(os.getenv("PORT", "5000"))
