@@ -1,11 +1,11 @@
 import hmac
-import math
 import os
 import re
 from flask import Flask, Response, render_template_string, request, jsonify
 import requests
 from dotenv import load_dotenv
 
+# Carrega as variáveis do arquivo .env
 load_dotenv()
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
@@ -20,32 +20,28 @@ HEADERS_APOLLO = {
     "x-api-key": APOLLO_API_KEY,
 }
 
-def formatar_localizacao_query(loc_raw):
-    loc_limpa = loc_raw.strip()
-    if "," in loc_limpa:
-        partes = [p.strip() for p in loc_limpa.split(",") if p.strip()]
-        return f'("{partes[0]}" OR "{loc_limpa}")'
-    elif "-" in loc_limpa:
-        partes = [p.strip() for p in loc_limpa.split("-") if p.strip()]
-        return f'("{partes[0]}" OR "{loc_limpa}")'
-    
-    return f'"{loc_limpa}"'
-
-def extrair_nome_e_cargo(titulo_google):
+def extrair_nome_de_titulo(titulo_google):
+    """
+    Limpa o título retornado pelo Google Search para extrair o Nome da pessoa.
+    Exemplo: "João Silva - Gerente de RH - Empresa | LinkedIn" -> "João Silva"
+    """
     if not titulo_google:
-        return "Candidato", "Não informado"
+        return "Candidato"
     
-    titulo_limpo = re.sub(r"\s*\|\s*LinkedIn.*$", "", str(titulo_google), flags=re.IGNORECASE)
+    # Remove marcas padrão do LinkedIn do final
+    titulo_limpo = re.sub(r"\s*\|\s*LinkedIn.*$", "", titulo_google, flags=re.IGNORECASE)
     titulo_limpo = re.sub(r"\s*-\s*LinkedIn.*$", "", titulo_limpo, flags=re.IGNORECASE)
     
+    # Pega a primeira parte antes do hífen ou travessão (normalmente onde fica o nome)
     partes = re.split(r"\s*[\-\|–]\s*", titulo_limpo)
-    
-    nome = partes[0].strip() if len(partes) > 0 else "Candidato"
-    cargo = partes[1].strip() if len(partes) > 1 else "Não informado"
-    
-    return nome, cargo
+    if partes:
+        return partes[0].strip()
+    return titulo_limpo.strip()
 
 def enriquecer_contato_apollo(linkedin_url):
+    """
+    Usa o Apollo para buscar o e-mail e telefone a partir da URL do LinkedIn.
+    """
     if not APOLLO_API_KEY or not linkedin_url:
         return "Não disponível", "Não disponível"
 
@@ -57,132 +53,99 @@ def enriquecer_contato_apollo(linkedin_url):
     }
 
     try:
-        res = requests.post(url_match, headers=HEADERS_APOLLO, json=payload, timeout=2)
+        res = requests.post(url_match, headers=HEADERS_APOLLO, json=payload, timeout=10)
         if res.status_code == 200:
-            data = res.json()
-            if isinstance(data, dict):
-                person = data.get("person") or {}
-                email = person.get("email") or "Não disponível"
+            person = res.json().get("person") or {}
+            email = person.get("email") or "Não disponível"
+            
+            # Busca de telefone
+            telefone = "Não disponível"
+            phones = person.get("phone_numbers") or []
+            if phones and isinstance(phones, list) and len(phones) > 0:
+                telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
+            elif person.get("sanitized_phone_number"):
+                telefone = person.get("sanitized_phone_number")
                 
-                telefone = "Não disponível"
-                phones = person.get("phone_numbers") or []
-                if isinstance(phones, list) and len(phones) > 0 and isinstance(phones[0], dict):
-                    telefone = phones[0].get("sanitized_number") or phones[0].get("raw_number") or "Não disponível"
-                elif person.get("sanitized_phone_number"):
-                    telefone = person.get("sanitized_phone_number")
-                    
-                return email, telefone
+            return email, telefone
     except Exception:
         pass
 
     return "Não disponível", "Não disponível"
 
-def buscar_candidatos_apify(cargos_raw, localizacao, limite=100):
+def buscar_candidatos_apify(cargo, localizacao, limite=20):
     if not APIFY_TOKEN:
-        return [], "Token do Apify ausente (APIFY_TOKEN). Verifique as variáveis de ambiente!"
+        return [], "ERRO CRÍTICO: Token do Apify ausente (APIFY_TOKEN). Verifique seu arquivo .env!"
 
-    cargos_lista = [c.strip() for c in cargos_raw.split(",") if c.strip()]
-    if not cargos_lista:
-        return [], "Por favor, informe ao menos um cargo."
-
-    loc_query = formatar_localizacao_query(localizacao)
-    queries_lista = [f'site:linkedin.com/in/ "{cargo}" {loc_query}' for cargo in cargos_lista]
-    query_final_str = "\n".join(queries_lista)
+    # Query X-Ray direcionada para perfis do LinkedIn Open To Work
+    query_search = f'site:linkedin.com/in/ "{cargo}" "{localizacao}" ("open to work" OR "#opentowork" OR "buscando oportunidade")'
     
-    # Calcula páginas dinamicamente (10 resultados por página do Google)
-    max_paginas = min(10, max(1, math.ceil(limite / 10)))
-
+    # Endpoint síncrono do Google Search Scraper no Apify
     apify_url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     
     payload = {
-        "queries": query_final_str,
-        "maxPagesPerQuery": max_paginas,
-        "resultsPerPage": 10
+        "queries": query_search,
+        "maxPagesPerQuery": 1,
+        "resultsPerPage": min(limite, 50)
     }
 
     try:
         res = requests.post(apify_url, json=payload, timeout=60)
         
         if res.status_code not in (200, 201):
-            return [], f"Apify retornou erro HTTP {res.status_code}: {res.text[:150]}"
+            return [], f"Apify retornou erro ({res.status_code}): {res.text}"
 
-        try:
-            dataset = res.json()
-        except Exception:
-            return [], "Apify retornou uma resposta em formato inválido."
-
+        dataset = res.json()
         if not dataset or not isinstance(dataset, list):
-            return [], "Nenhum resultado retornado do Apify."
+            return [], f"Nenhum resultado retornado pelo Apify para '{cargo}' em '{localizacao}'."
+
+        organics = dataset[0].get("organicResults") or []
+        
+        if not organics:
+            return [], f"Nenhum perfil 'Open to Work' encontrado no LinkedIn para '{cargo}' em '{localizacao}'."
 
         candidatos = []
-        urls_vistas = set()
-
-        for pagina_busca in dataset:
-            if not isinstance(pagina_busca, dict):
-                continue
-            organics = pagina_busca.get("organicResults") or []
+        for item in organics:
+            url_linkedin = item.get("url", "")
             
-            for item in organics:
-                if not isinstance(item, dict):
-                    continue
-                url_perfil = item.get("url", "")
-                
-                if "/in/" not in url_perfil or url_perfil in urls_vistas:
-                    continue
+            # Garante que é um link de perfil pessoal do LinkedIn
+            if "/in/" not in url_linkedin:
+                continue
 
-                urls_vistas.add(url_perfil)
+            titulo_item = item.get("title", "")
+            nome = extrair_nome_de_titulo(titulo_item)
+            
+            # Tenta enriquecer com E-mail e Telefone via Apollo usando a URL do LinkedIn
+            email, telefone = enriquecer_contato_apollo(url_linkedin)
 
-                titulo_item = item.get("title", "")
-                nome, cargo_extraido = extrair_nome_e_cargo(titulo_item)
-                cargo_final = cargo_extraido if cargo_extraido != "Não informado" else cargos_lista[0]
-
-                email, telefone = enriquecer_contato_apollo(url_perfil)
-
-                candidatos.append({
-                    "nome": nome,
-                    "cargo": cargo_final,
-                    "localizacao": localizacao,
-                    "email": email,
-                    "telefone": telefone,
-                    "link": url_perfil
-                })
-
-                if len(candidatos) >= limite:
-                    break
+            candidatos.append({
+                "nome": nome,
+                "cargo": cargo,
+                "localizacao": localizacao,
+                "email": email,
+                "telefone": telefone,
+                "linkedin": url_linkedin
+            })
 
             if len(candidatos) >= limite:
                 break
 
-        if not candidatos:
-            return [], f"Nenhum perfil encontrado no LinkedIn para '{cargos_raw}' em '{localizacao}'."
-
         return candidatos, None
 
-    except requests.exceptions.Timeout:
-        return [], "O tempo limite de busca esgotou no servidor. Reduza o número de candidatos solicitados."
     except Exception as e:
-        return [], f"Erro ao processar busca: {str(e)}"
+        return [], f"Falha ao conectar com Apify: {str(e)}"
 
 
 app = Flask(__name__)
 
-@app.errorhandler(Exception)
-def tratar_erro_generico(e):
-    code = getattr(e, "code", 500)
-    return jsonify({"status": "error", "message": f"Erro interno ({code}): {str(e)}"}), code
-
 def _pedir_login():
     return Response(
-        "Acesso restrito.", 401, {"WWW-Authenticate": 'Basic realm="Start RH - Candidate Search"'}
+        "Acesso restrito.", 401, {"WWW-Authenticate": 'Basic realm="Start RH - Apify Candidate Search"'}
     )
 
 @app.before_request
 def exigir_login():
     if not APP_USER or not APP_PASSWORD:
-        if request.path.startswith("/api/"):
-            return jsonify({"status": "error", "message": "APP_USER/APP_PASSWORD não configurados no painel."}), 503
-        return Response("APP_USER/APP_PASSWORD não configurados.", 503)
-
+        return Response("Servidor sem APP_USER/APP_PASSWORD configurados.", 503)
     auth = request.authorization
     if not auth:
         return _pedir_login()
@@ -198,53 +161,53 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Start RH - Busca: Perfis Dentro do Esperado</title>
+    <title>Start RH - Pesquisa Apify (Open to Work)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col items-center p-6">
-    <div class="max-w-6xl w-full bg-gray-800 rounded-xl shadow-2xl border border-gray-700 p-8 mt-6">
+    <div class="max-w-5xl w-full bg-gray-800 rounded-xl shadow-2xl border border-gray-700 p-8 mt-6">
         
         <div class="flex items-center justify-between border-b border-gray-700 pb-6 mb-6">
             <div>
-                <h1 class="text-2xl font-bold text-amber-500">
-                    Busca: Perfis Dentro do Esperado
+                <h1 class="text-2xl font-bold text-amber-500 flex items-center gap-2">
+                    <i class="fa-solid fa-spider"></i> Busca Apify: Candidatos "Open To Work"
                 </h1>
-                <p class="text-sm text-gray-400 mt-1">Pesquise perfis no LinkedIn por Cidade ou Estado em tempo real via Apify.</p>
+                <p class="text-sm text-gray-400 mt-1">Varredura em tempo real via Apify + Enriquecimento de Contato (E-mail e Telefone).</p>
             </div>
         </div>
 
         <div class="space-y-4">
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                    <label class="block text-sm font-medium text-gray-300 mb-1">Cargos Desejados (separados por vírgula):</label>
-                    <input type="text" id="cargoInput" placeholder="Ex: Gerente de RH, Recrutador, Tech Recruiter" 
+                    <label class="block text-sm font-medium text-gray-300 mb-1">Cargo do Candidato:</label>
+                    <input type="text" id="cargoInput" placeholder="Ex: Gerente de RH, Desenvolvedor Python" 
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
                 <div>
-                    <label class="block text-sm font-medium text-gray-300 mb-1">Localização (Cidade ou Estado):</label>
-                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: Campinas, Curitiba, Rio de Janeiro, SP" 
+                    <label class="block text-sm font-medium text-gray-300 mb-1">Localização do Candidato:</label>
+                    <input type="text" id="localizacaoInput" value="São Paulo" placeholder="Ex: São Paulo, Rio de Janeiro, Curitiba" 
                         class="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-amber-500 transition text-sm">
                 </div>
             </div>
 
             <div>
                 <label class="block text-sm font-medium text-gray-300 mb-1">
-                    Quantidade desejada de candidatos:
+                    Quantidade máxima de candidatos:
                 </label>
-                <input type="number" id="limiteInput" value="20" min="1" placeholder="Ex: 50"
+                <input type="number" id="limiteInput" value="20" min="1" max="50"
                     class="w-32 bg-gray-900 border border-gray-700 rounded-lg p-2 text-gray-100 focus:outline-none focus:border-amber-500 transition font-mono text-sm">
             </div>
 
             <button id="btnProcessar" onclick="processarHunting()" 
                 class="w-full bg-amber-500 hover:bg-amber-600 text-gray-950 font-bold py-3 px-6 rounded-lg transition flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20">
-                <i class="fa-solid fa-magnifying-glass"></i> Buscar
+                <i class="fa-solid fa-magnifying-glass"></i> Buscar via Apify
             </button>
         </div>
 
         <div id="loading" class="hidden my-8 text-center">
             <div class="inline-block animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
-            <p class="text-gray-400 text-sm mt-3 animate-pulse">Varrendo LinkedIn e cruzando telefones/e-mails no Apollo...</p>
+            <p class="text-gray-400 text-sm mt-3 animate-pulse">Executando Actor do Apify e enriquecendo dados de contato...</p>
         </div>
 
         <div id="resultadoContainer" class="hidden mt-8 border-t border-gray-700 pt-6">
@@ -265,7 +228,7 @@ HTML_TEMPLATE = """
             const localizacao = document.getElementById('localizacaoInput').value.trim();
             const limite = parseInt(document.getElementById('limiteInput').value) || 20;
             
-            if (!cargo) return alert('Por favor, informe ao menos um cargo.');
+            if (!cargo) return alert('Por favor, informe o cargo.');
 
             const btn = document.getElementById('btnProcessar');
             const loading = document.getElementById('loading');
@@ -285,22 +248,16 @@ HTML_TEMPLATE = """
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ cargo: cargo, localizacao: localizacao, limite: limite })
                 });
-
-                const contentType = response.headers.get("content-type") || "";
-                if (!contentType.includes("application/json")) {
-                    const rawHtml = await response.text();
-                    throw new Error(`Servidor respondeu com erro (${response.status}). Verifique os logs no Render.`);
-                }
-
                 const data = await response.json();
+                
                 loading.classList.add('hidden');
                 resultadoContainer.classList.remove('hidden');
 
-                if (response.ok && data.status === 'success') {
+                if (data.status === 'success') {
                     totalBadge.innerText = `${data.contatos.length} Candidato(s)`;
 
                     if (data.contatos.length === 0) {
-                        logList.innerHTML = `<p class="text-rose-400 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-triangle-exclamation"></i> <b>Aviso:</b> ${data.erro || 'Nenhum perfil encontrado.'}</p>`;
+                        logList.innerHTML = `<p class="text-rose-400 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-triangle-exclamation"></i> <b>Aviso:</b> ${data.erro}</p>`;
                     } else {
                         let tableHtml = `
                             <div class="overflow-x-auto">
@@ -308,8 +265,7 @@ HTML_TEMPLATE = """
                                     <thead>
                                         <tr class="bg-gray-900 text-amber-400 border-b border-gray-700 text-xs uppercase font-mono">
                                             <th class="p-3">Nome</th>
-                                            <th class="p-3">Cargo</th>
-                                            <th class="p-3">Localização</th>
+                                            <th class="p-3">Cargo Buscado</th>
                                             <th class="p-3">E-mail</th>
                                             <th class="p-3">Telefone</th>
                                             <th class="p-3 text-center">LinkedIn</th>
@@ -322,13 +278,12 @@ HTML_TEMPLATE = """
                                 <tr class="hover:bg-gray-800 transition">
                                     <td class="p-3 font-semibold text-gray-100">${c.nome}</td>
                                     <td class="p-3 text-gray-300">${c.cargo}</td>
-                                    <td class="p-3 text-gray-400">${c.localizacao}</td>
                                     <td class="p-3 font-mono text-xs text-amber-300/90">${c.email}</td>
                                     <td class="p-3 font-mono text-xs text-emerald-400">${c.telefone}</td>
                                     <td class="p-3 text-center">
-                                        <a href="${c.link}" target="_blank" class="inline-flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-3 py-1 rounded text-xs transition">
-                                            LinkedIn <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
-                                        </a>
+                                        ${c.linkedin 
+                                            ? `<a href="${c.linkedin}" target="_blank" class="inline-flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-3 py-1 rounded-md text-xs transition"><i class="fa-brands fa-linkedin"></i> Ver Perfil</a>` 
+                                            : '<span class="text-gray-500 text-xs">N/A</span>'}
                                     </td>
                                 </tr>`;
                         });
@@ -337,12 +292,12 @@ HTML_TEMPLATE = """
                         logList.innerHTML = tableHtml;
                     }
                 } else {
-                    logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-bomb"></i> <b>Erro:</b> ${data.message || data.erro || 'Falha na requisição.'}</p>`;
+                    logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-bomb"></i> Erro no servidor: ${data.message}</p>`;
                 }
             } catch (err) {
                 loading.classList.add('hidden');
                 resultadoContainer.classList.remove('hidden');
-                logList.innerHTML = `<p class="text-rose-500 p-3 bg-rose-500/10 rounded border border-rose-500/20"><i class="fa-solid fa-circle-exclamation"></i> ${err.message}</p>`;
+                logList.innerHTML = `<p class="text-rose-500">Erro na requisição: ${err.message}</p>`;
             } finally {
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -363,7 +318,7 @@ def api_buscar_candidatos():
     cargo = data.get("cargo", "").strip()
     localizacao = data.get("localizacao", "").strip()
     try:
-        limite = max(1, min(int(data.get("limite", 20)), 100))
+        limite = max(1, min(int(data.get("limite", 20)), 50))
     except (TypeError, ValueError):
         limite = 20
 
@@ -382,6 +337,6 @@ def api_buscar_candidatos():
 
 if __name__ == "__main__":
     porta = int(os.getenv("PORT", "5000"))
-    print("\n--- SERVIDOR LOCAL START RH INICIADO ---")
+    print("\n--- SERVIDOR LOCAL START RH (APIFY CANDIDATE SEARCH) INICIADO ---")
     print(f"Acesse no navegador: http://localhost:{porta}\n")
     app.run(host="127.0.0.1", port=porta, debug=False)
